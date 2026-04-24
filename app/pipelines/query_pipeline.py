@@ -13,9 +13,11 @@ from app.prompts.answer_with_context import (
     ANSWER_PROMPT_VERSION,
     build_user_prompt,
     is_refusal,
+    parse_response,
 )
 from app.prompts.system_prompt import SYSTEM_PROMPT, SYSTEM_PROMPT_VERSION
-from app.retrievers.vector_retriever import VectorRetriever
+from app.retrievers.hybrid_retriever import HybridRetriever
+from app.retrievers.reranker import LLMReranker
 from app.utils.token_counting import count_text_tokens, estimate_chat_cost_usd
 
 logger = get_logger(__name__)
@@ -25,11 +27,13 @@ class QueryPipeline:
     def __init__(
         self,
         *,
-        retriever: VectorRetriever,
+        hybrid_retriever: HybridRetriever,
+        reranker: LLMReranker,
         chat_client: OpenAIChatClient,
         settings: Settings,
     ) -> None:
-        self._retriever = retriever
+        self._retriever = hybrid_retriever
+        self._reranker = reranker
         self._chat_client = chat_client
         self._settings = settings
 
@@ -41,16 +45,30 @@ class QueryPipeline:
         document_ids: list[UUID] | None = None,
         top_k: int | None = None,
     ) -> Answer:
+        effective_top_k = top_k or self._settings.retrieval_top_k
         chunks = await self._retriever.retrieve(
             question=question,
             session=session,
             document_ids=document_ids,
-            top_k=top_k,
+            top_k=effective_top_k,
         )
 
         if not chunks:
             raise NoRelevantContext(
                 "No relevant context found for the question.",
+                details={"document_ids": [str(d) for d in document_ids] if document_ids else None},
+            )
+
+        if self._settings.rerank_enabled:
+            chunks = await self._reranker.rerank(
+                question=question,
+                chunks=chunks,
+                top_k=self._settings.rerank_top_k,
+            )
+
+        if not chunks:
+            raise NoRelevantContext(
+                "Reranker returned no relevant snippets.",
                 details={"document_ids": [str(d) for d in document_ids] if document_ids else None},
             )
 
@@ -63,18 +81,23 @@ class QueryPipeline:
 
         completion = await self._chat_client.complete(messages)
 
-        refused = is_refusal(completion.content)
+        parsed = parse_response(completion.content)
+        refused = is_refusal(parsed.answer)
         citations = (
             []
             if refused
             else [retrieved_chunk_to_citation(chunk) for chunk in trimmed]
         )
 
+        if parsed.reasoning and self._settings.log_verbose:
+            logger.debug("llm_reasoning", reasoning=parsed.reasoning)
+
         return Answer(
-            text=completion.content.strip(),
+            text=parsed.answer,
             citations=citations,
             is_grounded=not refused,
             refusal_reason="no_relevant_context_in_corpus" if refused else None,
+            reasoning=parsed.reasoning,
             prompt_tokens=completion.prompt_tokens,
             completion_tokens=completion.completion_tokens,
             estimated_cost_usd=estimate_chat_cost_usd(

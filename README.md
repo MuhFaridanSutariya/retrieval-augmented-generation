@@ -2,11 +2,13 @@
 
 A production-like RAG-based AI assistant that answers questions grounded **only** in the documents you upload.
 
-- **LLM:** OpenAI `gpt-5.4-2026-03-05`
+- **LLM:** OpenAI `gpt-5.4-2026-03-05` with Chain-of-Thought structured prompting (v2)
 - **Embeddings:** OpenAI `text-embedding-3-large` (3072 dim)
+- **Retrieval:** Hybrid — vector (FAISS) + BM25 (rank-bm25) fused via Reciprocal Rank Fusion, then LLM listwise reranked
 - **Vector store:** FAISS (local, file-backed, zero-service)
 - **Metadata store:** PostgreSQL (via SQLAlchemy async + Alembic)
 - **Cache:** Redis (response + embedding caches)
+- **Concurrency:** async read-write lock over FAISS so `/ask` calls run in parallel (~3.7× speedup measured on 5 cold concurrent requests)
 - **API:** FastAPI
 
 ## Prerequisites
@@ -223,7 +225,7 @@ make format      # ruff format + ruff check --fix
 uv run pytest tests/unit -v
 ```
 
-46 unit tests cover: chunker, token counting, cost estimation, hashing / cache keys, validators, prompt builder, mappers, and FAISS store (upsert, filter, delete, persistence).
+75 unit tests cover: chunker, token counting, cost estimation, hashing / cache keys, validators, prompt builder + CoT parser, mappers, FAISS store, async read-write lock, BM25 retrieval, RRF fusion, and LLM-reranker parsing.
 
 ### Adding a migration
 

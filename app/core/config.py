@@ -53,7 +53,11 @@ class Settings(BaseSettings):
     chunk_overlap_tokens: int = 50
     retrieval_top_k: int = 8
     rerank_top_k: int = 4
-    min_relevance_score: float = 0.25
+    rerank_enabled: bool = True
+    rerank_max_output_tokens: int = 100
+    hybrid_candidate_multiplier: int = 3
+    rrf_k: int = 60
+    min_relevance_score: float = 0.1
     max_context_tokens: int = 8000
     token_budget_safety_pad: int = 10
 

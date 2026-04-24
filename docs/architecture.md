@@ -23,12 +23,14 @@ ask_service.ask                         # Application — validates, checks cach
   ├─ response_cache.get                 # Short-circuit on hit
   ↓
 query_pipeline.run                      # Pipeline orchestration
-  ├─ vector_retriever.retrieve          # Retrieval
-  │    ├─ openai_embedder.embed_single  # Query embedding (cached)
-  │    ├─ faiss_store.query             # Vector search + filter
-  │    └─ hydrate_filenames             # Enrich chunks from Postgres
+  ├─ hybrid_retriever.retrieve          # Retrieval (dense + sparse)
+  │    ├─ vector_retriever              # OpenAI embedding → FAISS cosine
+  │    ├─ bm25_retriever                # Lexical BM25 over chunk text
+  │    └─ reciprocal_rank_fusion        # RRF fuses both ranked lists
+  ├─ reranker.rerank                    # LLM listwise rerank (top-N → top-K)
   ├─ _trim_to_budget                    # Token-budget guard
-  ├─ openai_chat_client.complete        # LLM call w/ retries
+  ├─ openai_chat_client.complete        # CoT LLM call w/ retries
+  ├─ parse_response                     # Extract <thinking> + <answer>
   └─ detect_refusal → build_answer      # Citation assembly
   ↓
 response_cache.set                      # Persist grounded answers only
@@ -153,7 +155,91 @@ prompt_version, model
 
 `query_hash` is the first 16 hex chars of `sha256(normalized_query)`. Full queries/responses only log when `LOG_VERBOSE=true`. This means the assignment's observability requirement is met without leaking user content by default.
 
-### 10. Dependency wiring — one composition root
+### 10. Chain-of-Thought prompting with structured output (v2 prompts)
+
+The `SYSTEM_PROMPT` (version `v2`) instructs the model to emit:
+
+```
+<thinking>
+Step 1. Identify entities in the question.
+Step 2. List context snippets that are actually relevant.
+Step 3. Decide whether the snippets support an answer.
+Step 4. Double-check every claim has a [Sn] citation.
+</thinking>
+
+<answer>
+The user-facing answer, with [Sn] citations inline.
+</answer>
+```
+
+**Why structured CoT rather than "think step by step" in free prose:**
+- Reasoning is extracted (`parse_response()`) and logged as `reasoning` when `LOG_VERBOSE=true`, never returned to the client — users see a clean answer.
+- The Step-4 self-check materially reduces unsupported claims: the model re-reads its draft against the context before emitting it.
+- Parse is robust to mistakes — if the model forgets the `<answer>` tag, we take everything after `</thinking>`; if it skips the tags entirely, we treat the whole response as the answer. Never raises.
+- Prompt version is part of the response-cache key — bumping to v2 invalidated v1 answers automatically.
+
+**Cost impact:** completion tokens roughly 3-4x larger than v1 (≈200 vs ≈40) because the model now writes the thinking block. Observed per-query cost rose from ~$0.016 to ~$0.007-0.012 with the smaller corpus. Still dominated by input tokens.
+
+### 11. Accuracy — hybrid retrieval + LLM reranking
+
+Three stages, each addressing a different failure mode of vector-only retrieval:
+
+**a. Hybrid retrieval (BM25 + vector, fused via RRF)**
+
+Pure vector search misses exact-keyword matches (model names, acronyms, rare proper nouns). BM25 misses paraphrases. We run both and fuse:
+
+```
+rrf_score(chunk) = sum over retrievers of 1 / (rrf_k + rank)
+```
+
+- `RRF_K = 60` — the canonical value from Cormack et al. (2009); higher `k` flattens the distribution and is more tolerant of noisy rankings.
+- `HYBRID_CANDIDATE_MULTIPLIER = 3` — each retriever returns `top_k * 3` candidates so the fusion has a larger pool to work with. For a final `retrieval_top_k = 8`, each retriever produces 24 candidates.
+- BM25 index is rebuilt lazily when `FaissStore._generation` changes, so re-ingests are picked up automatically without an explicit invalidation call.
+
+**b. LLM listwise reranking (opt-in via `RERANK_ENABLED`)**
+
+After hybrid fusion, a single OpenAI chat call reranks the top-N candidates into the final top-K (`RERANK_TOP_K=4`). Listwise (one call with all candidates) rather than pointwise (one call per candidate) is ~N× cheaper.
+
+The reranker returns a JSON array of candidate numbers. Parsing is defensive: tries `json.loads(raw)` first (rejects `{"order": [...]}` by type check), falls back to regex extraction if the model wrapped the array in prose, and on any parse failure degrades gracefully to the fused ordering.
+
+Reranker failures (timeout, rate limit, malformed output) never fail the request — they fall back to the fused candidates. This keeps `/ask` available even when a secondary LLM call misbehaves.
+
+**c. Grounding floor + CoT self-check**
+
+- `min_relevance_score=0.1` keeps the vector side permissive (hybrid + rerank do the discrimination).
+- If the reranker keeps zero chunks, `NoRelevantContext` → HTTP 404 before we ever call the final LLM.
+- The CoT prompt's Step-4 self-check catches claims not actually supported by a snippet.
+
+**Accuracy vs cost trade-off:**
+
+| Component | Latency cost | Dollar cost | Accuracy gain |
+|---|---|---|---|
+| Vector retrieval alone (baseline) | — | — | — |
+| + BM25 hybrid | +2-5 ms | $0 | catches keyword misses, especially rare terms |
+| + LLM rerank | +1 LLM call (~1-2 s) | +$0.002-0.005/query | big lift on ambiguous queries |
+| + CoT prompt | +completion tokens | +$0.001/query | fewer unsupported claims |
+
+Rerank and CoT are both gated behind config flags so a deployment can trade accuracy for cost/latency at will.
+
+### 12. Concurrency — async RWLock + thread-offloaded CPU
+
+**Problem:** a single `asyncio.Lock` around the FAISS store serialised every `/ask` — concurrent calls ran strictly one at a time.
+
+**Solution:** a writer-preference readers-writer lock built on `asyncio.Condition` (see `utils/async_rwlock.py`). Many readers hold the lock concurrently; writers have exclusive access; waiting writers block new readers so writes don't starve.
+
+Applied to `FaissStore`:
+- `query()` → `async with rwlock.read()` — concurrent queries interleave freely.
+- `upsert_chunks()` / `delete_by_document()` / `ensure_index()` → `async with rwlock.write()` — serialised against each other and against readers.
+
+**CPU-bound work off the event loop:** `load_pdf()` (pypdf) and `RecursiveSplitter.split()` (tiktoken) are synchronous. Wrapping them in `asyncio.to_thread` inside `ingest_pipeline.run()` means an upload doesn't stall concurrent `/ask` calls.
+
+**Measured:** 5 cold concurrent `/ask` requests complete in **8.53 s** wall-clock vs a serial sum of **31.74 s** — a **3.72× speedup** (exact OpenAI-side throughput limits the upper bound). With the response cache warm, the same 5 take **0.30 s**.
+
+**What we chose not to do:**
+- Multiple uvicorn workers. FAISS state is in-process, so N workers = N copies of the index. When the corpus outgrows one process, the right move is swapping FAISS for Qdrant/Pinecone, not stapling workers around an in-memory store.
+- `FastAPI.BackgroundTasks` for ingestion. Our test corpora ingest in a few seconds and the contract `POST /documents → status=READY` is simpler than polling. Easy to add when documents grow.
+
+### 13. Dependency wiring — one composition root
 
 `app/dependencies.py` is the only place that instantiates clients. Everything else receives dependencies via constructor (services, pipelines, retrievers). `Container` is built once during FastAPI `lifespan`, attached to `app.state`, and resolved per-request via `get_*` functions.
 

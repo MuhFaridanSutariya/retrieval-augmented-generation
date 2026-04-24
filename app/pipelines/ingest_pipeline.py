@@ -1,3 +1,4 @@
+import asyncio
 from uuid import UUID
 
 from app.chunkers.recursive_splitter import RecursiveSplitter
@@ -33,12 +34,14 @@ class IngestPipeline:
         file_type: FileType,
         content: bytes,
     ) -> int:
-        raw_text = load_document(content, file_type)
+        # PDF parsing and recursive token-splitting are CPU-bound and sync.
+        # Offload them so concurrent /ask calls keep flowing while ingestion runs.
+        raw_text = await asyncio.to_thread(load_document, content, file_type)
         if not raw_text.strip():
             logger.warning("ingest_empty_text", document_id=str(document_id))
             return 0
 
-        text_chunks = self._splitter.split(raw_text)
+        text_chunks = await asyncio.to_thread(self._splitter.split, raw_text)
         if not text_chunks:
             return 0
 

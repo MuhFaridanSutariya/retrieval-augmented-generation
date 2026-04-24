@@ -10,6 +10,7 @@ class Answer:
     citations: list[Citation] = field(default_factory=list)
     is_grounded: bool = True
     refusal_reason: str | None = None
+    reasoning: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
     estimated_cost_usd: Decimal = Decimal("0")

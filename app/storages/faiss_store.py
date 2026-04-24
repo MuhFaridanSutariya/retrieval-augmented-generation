@@ -12,6 +12,7 @@ from app.core.config import Settings
 from app.core.exceptions import VectorStoreError
 from app.core.logging import get_logger
 from app.models.domain.chunk import Chunk, RetrievedChunk
+from app.utils.async_rwlock import AsyncRWLock
 
 logger = get_logger(__name__)
 
@@ -24,14 +25,17 @@ class FaissStore:
         self._metadata_path = Path(settings.faiss_metadata_path)
         self._oversample = max(1, settings.faiss_oversample_factor)
 
-        self._lock = asyncio.Lock()
+        self._rwlock = AsyncRWLock()
         self._index: faiss.Index | None = None
         self._next_id: int = 0
         self._metadata: dict[int, dict] = {}
         self._chunk_to_faiss_id: dict[str, int] = {}
+        # Monotonic counter bumped on every upsert/delete so downstream caches
+        # (e.g. BM25 index) can detect staleness without deep equality checks.
+        self._generation: int = 0
 
     async def ensure_index(self) -> None:
-        async with self._lock:
+        async with self._rwlock.write():
             await asyncio.to_thread(self._load_or_create)
 
     def _load_or_create(self) -> None:
@@ -65,7 +69,7 @@ class FaissStore:
         if not chunks:
             return
 
-        async with self._lock:
+        async with self._rwlock.write():
             if self._index is None:
                 raise VectorStoreError("FAISS index is not initialised.")
             try:
@@ -112,6 +116,7 @@ class FaissStore:
         vectors = np.asarray(embeddings, dtype=np.float32)
         faiss.normalize_L2(vectors)
         self._index.add_with_ids(vectors, np.asarray(ids, dtype=np.int64))
+        self._generation += 1
         self._persist()
 
     async def query(
@@ -120,7 +125,7 @@ class FaissStore:
         top_k: int,
         document_ids: list[UUID] | None = None,
     ) -> list[RetrievedChunk]:
-        async with self._lock:
+        async with self._rwlock.read():
             if self._index is None:
                 raise VectorStoreError("FAISS index is not initialised.")
             if self._index.ntotal == 0:
@@ -175,13 +180,19 @@ class FaissStore:
         return retrieved
 
     async def delete_by_document(self, document_id: UUID) -> None:
-        async with self._lock:
+        async with self._rwlock.write():
             if self._index is None:
                 return
             try:
                 await asyncio.to_thread(self._delete_sync, document_id)
             except Exception as exc:
                 raise VectorStoreError(f"FAISS delete failed: {exc}") from exc
+
+    async def snapshot_chunks(self) -> tuple[int, list[dict]]:
+        # Returns (generation, [chunk_dict...]) so consumers (e.g. BM25) can
+        # detect when the corpus has changed and rebuild.
+        async with self._rwlock.read():
+            return self._generation, [dict(meta) for meta in self._metadata.values()]
 
     def _delete_sync(self, document_id: UUID) -> None:
         assert self._index is not None
@@ -201,6 +212,7 @@ class FaissStore:
             self._metadata.pop(faiss_id, None)
             self._chunk_to_faiss_id.pop(chunk_id, None)
 
+        self._generation += 1
         self._persist()
 
     def _persist(self) -> None:

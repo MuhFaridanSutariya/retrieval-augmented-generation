@@ -8,6 +8,9 @@ from app.embedders.openai_embedder import OpenAIEmbedder
 from app.llm_clients.openai_chat_client import OpenAIChatClient
 from app.pipelines.ingest_pipeline import IngestPipeline
 from app.pipelines.query_pipeline import QueryPipeline
+from app.retrievers.bm25_retriever import BM25Retriever
+from app.retrievers.hybrid_retriever import HybridRetriever
+from app.retrievers.reranker import LLMReranker
 from app.retrievers.vector_retriever import VectorRetriever
 from app.services.ask_service import AskService
 from app.services.document_service import DocumentService
@@ -35,6 +38,19 @@ class Container:
             vector_store=self.faiss_store,
             settings=settings,
         )
+        self.bm25_retriever = BM25Retriever(
+            faiss_store=self.faiss_store,
+            settings=settings,
+        )
+        self.hybrid_retriever = HybridRetriever(
+            vector_retriever=self.vector_retriever,
+            bm25_retriever=self.bm25_retriever,
+            settings=settings,
+        )
+        self.reranker = LLMReranker(
+            chat_client=self.chat_client,
+            settings=settings,
+        )
 
         self.ingest_pipeline = IngestPipeline(
             splitter=self.splitter,
@@ -43,7 +59,8 @@ class Container:
             settings=settings,
         )
         self.query_pipeline = QueryPipeline(
-            retriever=self.vector_retriever,
+            hybrid_retriever=self.hybrid_retriever,
+            reranker=self.reranker,
             chat_client=self.chat_client,
             settings=settings,
         )

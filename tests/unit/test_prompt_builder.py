@@ -1,7 +1,11 @@
 from uuid import uuid4
 
 from app.models.domain.chunk import RetrievedChunk
-from app.prompts.answer_with_context import build_user_prompt, is_refusal
+from app.prompts.answer_with_context import (
+    build_user_prompt,
+    is_refusal,
+    parse_response,
+)
 from app.prompts.system_prompt import SYSTEM_PROMPT
 
 
@@ -9,6 +13,13 @@ def test_system_prompt_contains_grounding_instructions() -> None:
     assert "only" in SYSTEM_PROMPT.lower()
     assert "CONTEXT" in SYSTEM_PROMPT
     assert "do not have enough information" in SYSTEM_PROMPT.lower()
+
+
+def test_system_prompt_requests_chain_of_thought_tags() -> None:
+    assert "<thinking>" in SYSTEM_PROMPT
+    assert "</thinking>" in SYSTEM_PROMPT
+    assert "<answer>" in SYSTEM_PROMPT
+    assert "</answer>" in SYSTEM_PROMPT
 
 
 def test_build_user_prompt_numbers_chunks_sequentially() -> None:
@@ -28,6 +39,7 @@ def test_build_user_prompt_numbers_chunks_sequentially() -> None:
     assert "[S2]" in prompt
     assert "[S3]" in prompt
     assert "What is X?" in prompt
+    assert "<thinking>" in prompt or "thinking" in prompt.lower()
 
 
 def test_build_user_prompt_handles_empty_context() -> None:
@@ -47,6 +59,43 @@ def test_build_user_prompt_includes_source_filenames() -> None:
     )
     prompt = build_user_prompt("Q?", [chunk])
     assert "my_doc.pdf" in prompt
+
+
+def test_parse_response_extracts_answer_and_reasoning() -> None:
+    raw = (
+        "<thinking>\nStep 1. The question asks about X.\n"
+        "Step 2. S1 mentions X directly.\n</thinking>\n"
+        "<answer>\nX is Y [S1].\n</answer>"
+    )
+    parsed = parse_response(raw)
+    assert parsed.answer == "X is Y [S1]."
+    assert parsed.reasoning is not None
+    assert "Step 1" in parsed.reasoning
+
+
+def test_parse_response_handles_missing_thinking_block() -> None:
+    parsed = parse_response("<answer>Just the answer [S1].</answer>")
+    assert parsed.answer == "Just the answer [S1]."
+    assert parsed.reasoning is None
+
+
+def test_parse_response_falls_back_when_no_tags() -> None:
+    parsed = parse_response("X is Y.")
+    assert parsed.answer == "X is Y."
+    assert parsed.reasoning is None
+
+
+def test_parse_response_handles_forgotten_answer_tag() -> None:
+    raw = "<thinking>Reasoning here.</thinking>\nFinal sentence."
+    parsed = parse_response(raw)
+    assert parsed.answer == "Final sentence."
+    assert parsed.reasoning == "Reasoning here."
+
+
+def test_parse_response_empty_string() -> None:
+    parsed = parse_response("")
+    assert parsed.answer == ""
+    assert parsed.reasoning is None
 
 
 def test_is_refusal_detects_refusal_sentence() -> None:
