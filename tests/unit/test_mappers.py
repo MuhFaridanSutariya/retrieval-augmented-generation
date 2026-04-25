@@ -99,13 +99,14 @@ def test_answer_to_response_maps_usage_and_request_id() -> None:
         prompt_version="system:v1/user:v1",
         cache_hit=False,
     )
-    response = answer_to_response(answer, request_id="req-123")
+    response = answer_to_response(answer, request_id="req-123", session_id="sess-1")
     assert response.answer == "The answer is 42 [S1]."
     assert response.usage.prompt_tokens == 100
     assert response.usage.completion_tokens == 20
     assert response.usage.total_tokens == 120
     assert response.usage.estimated_cost_usd == Decimal("0.016")
     assert response.request_id == "req-123"
+    assert response.session_id == "sess-1"
     assert len(response.citations) == 1
 
 
@@ -127,7 +128,7 @@ def test_answer_to_response_includes_stage_timings() -> None:
             total_ms=12508.1,
         ),
     )
-    response = answer_to_response(answer, request_id="r1")
+    response = answer_to_response(answer, request_id="r1", session_id="s1")
     assert response.usage.timings.embed_ms == 812.3
     assert response.usage.timings.retrieve_ms == 4.5
     assert response.usage.timings.rerank_ms == 10456.7
@@ -146,6 +147,6 @@ def test_answer_to_response_defaults_timings_to_zero() -> None:
         prompt_version="static:v1",
         cache_hit=False,
     )
-    response = answer_to_response(answer, request_id="r2")
+    response = answer_to_response(answer, request_id="r2", session_id="s2")
     assert response.usage.timings.total_ms == 0.0
     assert response.usage.timings.rerank_ms == 0.0

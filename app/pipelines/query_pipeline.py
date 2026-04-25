@@ -51,6 +51,7 @@ class QueryPipeline:
         use_cot: bool = False,
         use_rerank: bool | None = None,
         use_tools: bool = False,
+        history: list[tuple[str, str]] | None = None,
     ) -> Answer:
         effective_rerank = (
             self._settings.rerank_enabled if use_rerank is None else use_rerank
@@ -93,13 +94,19 @@ class QueryPipeline:
 
         trimmed = self._trim_to_budget(chunks, system_prompt=system_prompt)
 
-        messages = [
+        messages: list[ChatMessage] = [
             ChatMessage(role="system", content=system_prompt),
+        ]
+        if history:
+            messages.extend(
+                ChatMessage(role=role, content=content) for role, content in history
+            )
+        messages.append(
             ChatMessage(
                 role="user",
                 content=build_user_prompt(question, trimmed, use_cot=use_cot),
             ),
-        ]
+        )
 
         tool_invocation_records: list[ToolInvocationRecord] = []
 

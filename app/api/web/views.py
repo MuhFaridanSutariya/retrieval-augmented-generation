@@ -1,15 +1,22 @@
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Request, Response, UploadFile, status
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from app.dependencies import get_ask_service, get_document_service
+from app.core.config import Settings
+from app.dependencies import (
+    get_ask_service,
+    get_conversation_store,
+    get_document_service,
+    get_settings_dep,
+)
 from app.models.domain.answer import Answer
 from app.models.domain.document import Document
 from app.services.ask_service import AskService
 from app.services.document_service import DocumentService
+from app.storages.conversation_store import ConversationStore
 from app.utils.sample_pdf import SAMPLE_FILENAME, generate_sample_complex_pdf
 
 _TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "templates"
@@ -83,6 +90,7 @@ async def ask(
     enable_rerank: str = Form(""),
     enable_tools: str = Form(""),
     ask_service: AskService = Depends(get_ask_service),
+    settings: Settings = Depends(get_settings_dep),
 ) -> HTMLResponse:
     document_ids: list[UUID] | None = None
     if document_id.strip():
@@ -97,6 +105,8 @@ async def ask(
     use_rerank = enable_rerank.strip().lower() in truthy
     use_tools = enable_tools.strip().lower() in truthy
 
+    cookie_session_id = request.cookies.get(settings.chat_session_cookie_name)
+
     try:
         result = await ask_service.ask(
             question=question,
@@ -104,8 +114,9 @@ async def ask(
             use_cot=use_cot,
             use_rerank=use_rerank,
             use_tools=use_tools,
+            session_id=cookie_session_id,
         )
-        return templates.TemplateResponse(
+        response = templates.TemplateResponse(
             request,
             "_chat_exchange.html",
             {
@@ -115,6 +126,14 @@ async def ask(
                 "error": None,
             },
         )
+        response.set_cookie(
+            key=settings.chat_session_cookie_name,
+            value=result.session_id,
+            max_age=settings.chat_session_cookie_max_age_seconds,
+            httponly=True,
+            samesite="lax",
+        )
+        return response
     except Exception as exc:
         return templates.TemplateResponse(
             request,
@@ -126,6 +145,20 @@ async def ask(
                 "error": _classify_error(exc),
             },
         )
+
+
+@router.post("/web/chat/clear", response_class=HTMLResponse)
+async def clear_chat(
+    request: Request,
+    settings: Settings = Depends(get_settings_dep),
+    conversation_store: ConversationStore = Depends(get_conversation_store),
+) -> HTMLResponse:
+    cookie_session_id = request.cookies.get(settings.chat_session_cookie_name)
+    if cookie_session_id:
+        await conversation_store.clear(cookie_session_id)
+    response = HTMLResponse(content="", status_code=status.HTTP_200_OK)
+    response.delete_cookie(settings.chat_session_cookie_name)
+    return response
 
 
 def _empty_answer() -> Answer:

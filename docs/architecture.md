@@ -381,6 +381,30 @@ For `GREETING`/`FAREWELL` from any layer, the response has `model="static"`, `co
 
 Single-word common phrases hit Layer 1 and bypass OpenAI entirely. Multi-word variants fall through to Layer 2 — slower (one OpenAI embed call) but still semantically correct and still `cost=$0` because the LLM is never invoked. Real RAG queries flow through unchanged.
 
+#### Conversation memory — last-3-turn window in Redis
+
+Multi-turn follow-ups (`"and Q4?"`, `"compare those two"`) need the model to see the previous turn(s). We store the **last 3 user/assistant turns** per session in Redis and prepend them between the system prompt and the new user prompt.
+
+- **Key**: `conversation:{session_id}` → JSON list of `{role, content}` entries. TTL `CONVERSATION_TTL_SECONDS=3600`.
+- **Window**: `CONVERSATION_MAX_TURNS=3` (= 6 messages). Trimmed at write time so the prompt can never grow unbounded.
+- **Session id**: HTTP-only `chat_session_id` cookie for the web UI; explicit `session_id` field on `AskRequest` for non-browser clients. `AskService` accepts either, generates a new `uuid4().hex` if neither is supplied, and echoes the active id back in `AskResponse.session_id` (so curl-style multi-turn just needs `-c jar.txt -b jar.txt`).
+- **Cache isolation**: `build_response_cache_key(...)` mixes a `sha256` of the history into the key. Same question with different prior turns → different cache bucket. No cross-session bleed.
+- **Static-reply paths skip history**: greetings/farewells (Layer 1 + Layer 2 non-RAG) intentionally don't record turns — they don't add useful context for later RAG turns and they shouldn't push real Q&A out of the 3-turn window.
+- **Best-effort writes**: Redis errors during `append_turn` are logged and swallowed. The next turn just sees no history rather than the whole `/ask` failing.
+- **Clear endpoints**: `DELETE /api/v1/sessions/{id}` (explicit) and `DELETE /api/v1/sessions` (uses the cookie). The web UI's 🗑️ Clear chat button posts to `POST /web/chat/clear` which deletes the Redis key, clears the cookie, and HTMX wipes the chat-history div.
+
+##### Why last-3 turns, not rolling summarization
+
+Three turns covers the common follow-up cases (coreference resolution, "what about X" pivots) at the cost of ~150–400 extra prompt tokens per turn. Rolling summarization would buy a longer effective window but adds another LLM call per turn (latency + cost) for a Q&A surface where users rarely chain more than 2–3 follow-ups. The wrapper is structured so swapping to a `summarize_turns_4_to_n()` step is a single-method change in `ConversationStore.get()`.
+
+##### Verified live
+
+```
+Q1 alone:       "p95 latency in Q1 2026 was 3100 ms, SLA target ≤ 5000 ms."
+Q2 with memory: "Assuming you mean Q4 2025, the p95 latency was 5200 ms..."   ← coreference works
+Q2 cleared:     "Q4 2025: p50=1900ms, p95=5200ms, p99=8800ms, ..."             ← no anchor → metric dump
+```
+
 ### 15. Tool calling — MCP-shaped registry + tool-aware completion loop
 
 The bonus assignment listed "Allow LLM to call a simple tool (e.g., calculator or search)" with the optional ask to use MCP-like concepts. We implemented:

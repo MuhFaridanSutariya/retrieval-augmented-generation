@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from app.api.application.health_routes import router as health_router
 from app.api.exception_handlers import register_exception_handlers
 from app.api.v1.routes.ask_routes import router as ask_router
+from app.api.v1.routes.conversation_routes import router as conversation_router
 from app.api.v1.routes.demo_routes import router as demo_router
 from app.api.v1.routes.document_routes import router as document_router
 from app.api.web.views import router as web_router
@@ -56,6 +57,7 @@ def create_app() -> FastAPI:
     app.include_router(ask_router, prefix=settings.api_v1_prefix)
     app.include_router(document_router, prefix=settings.api_v1_prefix)
     app.include_router(demo_router, prefix=settings.api_v1_prefix)
+    app.include_router(conversation_router, prefix=settings.api_v1_prefix)
     app.include_router(web_router)
 
     return app

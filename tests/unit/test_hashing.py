@@ -3,6 +3,7 @@ from uuid import UUID
 from app.utils.hashing import (
     build_embedding_cache_key,
     build_response_cache_key,
+    fingerprint_history,
     sha256_bytes,
     sha256_hex,
 )
@@ -70,3 +71,31 @@ def test_embedding_cache_key_varies_by_model() -> None:
     key_small = build_embedding_cache_key("hello", "text-embedding-3-small")
     key_large = build_embedding_cache_key("hello", "text-embedding-3-large")
     assert key_small != key_large
+
+
+def test_fingerprint_history_empty_is_blank() -> None:
+    assert fingerprint_history([]) == ""
+
+
+def test_fingerprint_history_changes_with_history() -> None:
+    fp_a = fingerprint_history([("user", "hi"), ("assistant", "hello")])
+    fp_b = fingerprint_history([("user", "different"), ("assistant", "hello")])
+    assert fp_a != fp_b
+
+
+def test_response_cache_key_varies_by_history_fingerprint() -> None:
+    key_no_history = build_response_cache_key(
+        question="and Q4?",
+        document_ids=None,
+        model="m",
+        prompt_version="v1",
+        history_fingerprint="",
+    )
+    key_with_history = build_response_cache_key(
+        question="and Q4?",
+        document_ids=None,
+        model="m",
+        prompt_version="v1",
+        history_fingerprint="abc123",
+    )
+    assert key_no_history != key_with_history

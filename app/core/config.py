@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     response_cache_ttl_seconds: int = 3600
     embedding_cache_ttl_seconds: int = 2_592_000
+    conversation_ttl_seconds: int = 3600
+    conversation_max_turns: int = 3
+    chat_session_cookie_name: str = "chat_session_id"
+    chat_session_cookie_max_age_seconds: int = 86_400
 
     openai_api_key: str
     openai_chat_model: str = "gpt-5.4-2026-03-05"

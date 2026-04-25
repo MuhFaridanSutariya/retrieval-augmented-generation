@@ -19,8 +19,9 @@ from app.prompts.static_responses import (
     STATIC_RESPONSE_VERSION,
 )
 from app.prompts.system_prompt import select_system_prompt
+from app.storages.conversation_store import ConversationStore
 from app.storages.database import Database
-from app.utils.hashing import sha256_hex
+from app.utils.hashing import fingerprint_history, sha256_hex
 from app.validators.intent_classifier import IntentClassifier, fast_path_classify
 from app.validators.query_validator import validate_question
 
@@ -28,11 +29,12 @@ logger = get_logger(__name__)
 
 
 class AskResult:
-    __slots__ = ("answer", "request_id")
+    __slots__ = ("answer", "request_id", "session_id")
 
-    def __init__(self, answer: Answer, request_id: str) -> None:
+    def __init__(self, answer: Answer, request_id: str, session_id: str) -> None:
         self.answer = answer
         self.request_id = request_id
+        self.session_id = session_id
 
 
 class AskService:
@@ -44,6 +46,7 @@ class AskService:
         response_cache: ResponseCache,
         embedder: OpenAIEmbedder,
         intent_classifier: IntentClassifier,
+        conversation_store: ConversationStore,
         settings: Settings,
     ) -> None:
         self._database = database
@@ -51,6 +54,7 @@ class AskService:
         self._response_cache = response_cache
         self._embedder = embedder
         self._intent_classifier = intent_classifier
+        self._conversation_store = conversation_store
         self._settings = settings
 
     async def ask(
@@ -62,13 +66,15 @@ class AskService:
         use_cot: bool = False,
         use_rerank: bool | None = None,
         use_tools: bool = False,
+        session_id: str | None = None,
     ) -> AskResult:
         effective_rerank = (
             self._settings.rerank_enabled if use_rerank is None else use_rerank
         )
-        # Cache key includes the prompt-variant, rerank flag, and tools flag so all
-        # eight combinations of (CoT, rerank, tools) on/off don't collide and
-        # toggling any one of them invalidates the cache as expected.
+        active_session_id = session_id or uuid4().hex
+        # Cache key includes the prompt-variant, rerank flag, tools flag, and a
+        # history fingerprint so identical questions with different prior turns
+        # don't collide. Greetings/farewells skip history entirely.
         _, system_version = select_system_prompt(use_cot=use_cot)
         user_version = select_user_prompt_version(use_cot=use_cot)
         prompt_version = (
@@ -94,7 +100,7 @@ class AskService:
                 started=started,
                 intent=fast_intent,
             )
-            return AskResult(answer, request_id)
+            return AskResult(answer, request_id, active_session_id)
 
         # Layer 2: embedding classifier. Embed once, reuse for retrieval via the cache.
         embed_started = time.perf_counter()
@@ -113,17 +119,27 @@ class AskService:
                 started=started,
                 intent=intent,
             )
-            return AskResult(answer, request_id)
+            return AskResult(answer, request_id, active_session_id)
+
+        history_turns = await self._conversation_store.get(active_session_id)
+        history_pairs = [(turn.role, turn.content) for turn in history_turns]
+        history_fp = fingerprint_history(history_pairs)
 
         cached = await self._response_cache.get(
             question=validated_question,
             document_ids=document_ids,
             model=self._settings.openai_chat_model,
             prompt_version=prompt_version,
+            history_fingerprint=history_fp,
         )
         if cached is not None:
             cached.timings.embed_ms = embed_ms
             cached.timings.total_ms = (time.perf_counter() - started) * 1000
+            await self._conversation_store.append_turn(
+                active_session_id,
+                user_message=validated_question,
+                assistant_message=cached.text,
+            )
             self._emit_metrics(
                 request_id=request_id,
                 query_hash=query_hash,
@@ -131,7 +147,7 @@ class AskService:
                 started=started,
                 intent=intent,
             )
-            return AskResult(cached, request_id)
+            return AskResult(cached, request_id, active_session_id)
 
         try:
             async with self._database.session() as session:
@@ -143,11 +159,17 @@ class AskService:
                     use_cot=use_cot,
                     use_rerank=use_rerank,
                     use_tools=use_tools,
+                    history=history_pairs,
                 )
         except NoRelevantContext:
             answer = self._off_topic_answer()
             answer.timings.embed_ms = embed_ms
             answer.timings.total_ms = (time.perf_counter() - started) * 1000
+            await self._conversation_store.append_turn(
+                active_session_id,
+                user_message=validated_question,
+                assistant_message=answer.text,
+            )
             self._emit_metrics(
                 request_id=request_id,
                 query_hash=query_hash,
@@ -155,7 +177,7 @@ class AskService:
                 started=started,
                 intent=intent,
             )
-            return AskResult(answer, request_id)
+            return AskResult(answer, request_id, active_session_id)
 
         answer.timings.embed_ms = embed_ms
         answer.timings.total_ms = (time.perf_counter() - started) * 1000
@@ -167,7 +189,14 @@ class AskService:
                 model=self._settings.openai_chat_model,
                 prompt_version=prompt_version,
                 answer=answer,
+                history_fingerprint=history_fp,
             )
+
+        await self._conversation_store.append_turn(
+            active_session_id,
+            user_message=validated_question,
+            assistant_message=answer.text,
+        )
 
         self._emit_metrics(
             request_id=request_id,
@@ -176,7 +205,7 @@ class AskService:
             started=started,
             intent=intent,
         )
-        return AskResult(answer, request_id)
+        return AskResult(answer, request_id, active_session_id)
 
     def _static_answer(self, intent: Intent) -> Answer:
         text = GREETING_RESPONSE if intent is Intent.GREETING else FAREWELL_RESPONSE

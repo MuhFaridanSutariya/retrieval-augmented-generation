@@ -8,6 +8,13 @@ class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     document_ids: list[UUID] | None = Field(default=None, max_length=50)
     top_k: int | None = Field(default=None, ge=1, le=20)
+    session_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Conversation memory key. Send the value returned in the previous "
+        "AskResponse to continue the same conversation; omit to start a new one. "
+        "The web UI uses an HTTP-only cookie instead of this field.",
+    )
     enable_cot: bool = Field(
         default=False,
         description="Opt in to Chain-of-Thought prompting (slower, ~5x output tokens, "
@@ -72,4 +79,8 @@ class AskResponse(BaseModel):
     citations: list[CitationResponse] = Field(default_factory=list)
     usage: UsageResponse
     tool_invocations: list[ToolInvocationResponse] = Field(default_factory=list)
+    session_id: str = Field(
+        description="Echo this value back as AskRequest.session_id (or rely on the "
+        "chat_session_id cookie) to continue the same conversation."
+    )
     request_id: str

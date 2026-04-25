@@ -100,6 +100,8 @@ API is live at http://localhost:8000. OpenAPI docs at http://localhost:8000/docs
 | `PATCH` | `/api/v1/documents/{id}` | Rename a document |
 | `DELETE` | `/api/v1/documents/{id}` | Delete a document + its vectors |
 | `POST` | `/api/v1/ask` | Ask a grounded question |
+| `DELETE` | `/api/v1/sessions/{id}` | Forget the last few turns of a chat session |
+| `DELETE` | `/api/v1/sessions` | Forget the chat session identified by the `chat_session_id` cookie |
 
 ## Sample usage
 
@@ -157,9 +159,12 @@ Response:
     "model": "gpt-5.4-2026-03-05",
     "cache_hit": false
   },
+  "session_id": "feba0b5481564e569dc316e530e09f09",
   "request_id": "..."
 }
 ```
+
+The response also sets an HTTP-only `chat_session_id` cookie that the next `/ask` call can echo back automatically — see [Conversation memory](#conversation-memory--last-3-turns).
 
 Scope the question to specific documents:
 ```bash
@@ -206,6 +211,42 @@ We picked this two-layer setup over a small LLM router for four reasons:
 - `"hellooooo"`, `"thxxxxx"`, `"byeeeee"`: all **<0.25 s**
 
 See [docs/architecture.md §14](docs/architecture.md) for the full design rationale and verified-live results.
+
+## Conversation memory — last 3 turns
+
+Multi-turn follow-ups like *"and Q4?"* or *"how does that compare?"* only work if the model can see what was just said. The assistant keeps the **last 3 user/assistant turns** per session in Redis and prepends them between the system prompt and the new user prompt.
+
+| Aspect | Choice | Reason |
+|---|---|---|
+| Where memory lives | Redis (`conversation:{session_id}`, JSON list, `CONVERSATION_TTL_SECONDS=3600`) | Same store as the response cache; survives uvicorn restarts; auto-expires so abandoned sessions GC themselves. |
+| How sessions are tracked | HTTP-only `chat_session_id` cookie (web UI) **or** explicit `session_id` field on `AskRequest` (JSON API) | Cookies are zero-config for the FE; the JSON field is for non-browser clients. |
+| Window size | `CONVERSATION_MAX_TURNS=3` (= last 6 messages) | Three turns is enough to catch coreference (`"and Q4?"`, `"compare those two"`). Beyond that, prompt grows and cost grows with no clear quality lift on grounded Q&A. |
+| Cache isolation | Response-cache key includes `sha256` of the history | Same question with different prior turns gets a different cache bucket — no cross-session bleed. |
+| Greetings/farewells | Skip history (fast-path doesn't store turns) | Static replies don't add useful context; keeps the window for actual RAG turns. |
+
+**Live-verified** with `Q1: "What was the p95 latency in Q1 2026 and the SLA target?"` → `Q2: "And Q4?"`:
+
+- Q1 alone: `"p95 latency in Q1 2026 was 3100 ms, SLA target ≤ 5000 ms."`
+- Q2 with memory: `"Assuming you mean Q4 2025, the p95 latency was 5200 ms..."` — correctly inferred Q4 *p95 latency* from Q1's context.
+- Q2 after **🗑️ Clear chat** (no memory): a generic Q4 2025 metrics dump (p50, p95, p99, availability, error rate, cache hit, cost) — the assistant has no anchor for what specifically to look up.
+
+The web UI shows a small **🗑️ Clear chat** button next to the chat header. The JSON API exposes `DELETE /api/v1/sessions/{id}` (or `DELETE /api/v1/sessions` to clear whatever the cookie points at).
+
+```bash
+# Multi-turn via JSON API — pass session_id explicitly, or use a cookie jar.
+curl -s -c jar.txt -b jar.txt -X POST http://localhost:8000/api/v1/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What was the p95 latency in Q1 2026 and the SLA target?"}'
+
+curl -s -c jar.txt -b jar.txt -X POST http://localhost:8000/api/v1/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "And Q4?"}'
+
+# Clear when done
+curl -s -c jar.txt -b jar.txt -X DELETE http://localhost:8000/api/v1/sessions
+```
+
+If Redis is briefly unavailable the store fails open: the next turn just sees no history rather than the request erroring out.
 
 ## Three UI toggles for accuracy / cost / latency
 
@@ -436,7 +477,7 @@ No bare `except:` anywhere. Infra errors never leak vendor tracebacks to clients
 4. **(Optional) Run the test suite**:
    ```bash
    uv run pytest tests/unit -q
-   # 138 passed
+   # 149 passed
    ```
 
 ### Web UI walkthrough
@@ -610,7 +651,7 @@ Each item below addresses a known limitation. The list is grouped by theme and o
 | 17 | No tool calling (assignment bonus). | Add a `tools/` registry (calculator, search) and use OpenAI's tool-call API. Each tool implementation becomes a one-file plugin. | Architecture already supports it (`agents/` and `tools/` are listed in CLAUDE.md's chatbot template). |
 | 18 | No safety classifier on inputs — jailbreak attempts go straight to the LLM. | Add a lightweight prompt-injection detector (regex + small classifier) in `validators/query_validator.py`. | Fast; low risk of false positives. |
 | 19 | No structured-output validation. | When clients want JSON answers, define a Pydantic schema and use OpenAI's `response_format={"type": "json_schema", ...}`. Validate before returning. | Useful for downstream agent/tool integration. |
-| 20 | No conversation/session memory — each `/ask` is independent. | Add a `sessions/` table + memory summarization (last N turns + rolling summary) injected into the user prompt. | Significant — turns the assistant into a chatbot rather than a Q&A endpoint. |
+| 20 | ~~No conversation/session memory — each `/ask` is independent.~~ **Shipped (last 3 turns in Redis, see [Conversation memory](#conversation-memory--last-3-turns)).** Next step: rolling summarization for sessions older than 3 turns instead of a hard-drop window. | Add a `summarize_history` step that compresses turns 4..N into a single `[summary]` system message before retrieval. | One extra cheap LLM call per turn after the third; quality lift on long debugging conversations. |
 
 ### Evaluation & cost discipline
 
@@ -666,7 +707,7 @@ app/
 └── main.py                 # FastAPI app factory + lifespan
 
 migrations/versions/        # Alembic (autogenerated, reviewed)
-tests/unit/                 # 138 unit tests for deterministic layers
+tests/unit/                 # 149 unit tests for deterministic layers
 data/
 ├── corpus/                 # Source documents (gitignored)
 └── index/                  # FAISS index file + metadata
@@ -690,7 +731,7 @@ make format      # ruff format + ruff check --fix
 uv run pytest tests/unit -v
 ```
 
-138 unit tests cover: chunker, token counting, cost estimation, hashing / cache keys, validators, prompt builder (simple + CoT variants + parser), mappers (including stage-timings round-trip), FAISS store, async read-write lock, BM25 retrieval, RRF fusion, LLM-reranker parsing, text/PDF loaders, PDF table renderer, intent classifier (embedding anchors + fast-path with run-collapse normalization), tool registry (registration, validation, invocation, error capture), and the calculator AST evaluator (safety against function calls, attribute access, names, lambdas, strings).
+149 unit tests cover: chunker, token counting, cost estimation, hashing / cache keys (including history-fingerprint isolation), validators, prompt builder (simple + CoT variants + parser), mappers (including stage-timings round-trip and `session_id` echo), FAISS store, async read-write lock, BM25 retrieval, RRF fusion, LLM-reranker parsing, text/PDF loaders, PDF table renderer, intent classifier (embedding anchors + fast-path with run-collapse normalization), tool registry (registration, validation, invocation, error capture), the calculator AST evaluator (safety against function calls, attribute access, names, lambdas, strings), and the conversation store (roundtrip, max-turn trimming, Redis-failure swallow, corrupt-payload handling, role filtering, clear).
 
 ### Adding a migration
 

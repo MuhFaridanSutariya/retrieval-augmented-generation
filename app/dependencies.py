@@ -14,6 +14,7 @@ from app.retrievers.reranker import LLMReranker
 from app.retrievers.vector_retriever import VectorRetriever
 from app.services.ask_service import AskService
 from app.services.document_service import DocumentService
+from app.storages.conversation_store import ConversationStore
 from app.storages.database import Database
 from app.storages.faiss_store import FaissStore
 from app.storages.file_storage import FileStorage
@@ -32,6 +33,7 @@ class Container:
 
         self.embedding_cache = EmbeddingCache(self.redis_store, settings)
         self.response_cache = ResponseCache(self.redis_store, settings)
+        self.conversation_store = ConversationStore(self.redis_store, settings)
 
         self.chat_client = OpenAIChatClient(settings)
         self.embedder = OpenAIEmbedder(settings, self.embedding_cache)
@@ -94,6 +96,7 @@ class Container:
             response_cache=self.response_cache,
             embedder=self.embedder,
             intent_classifier=self.intent_classifier,
+            conversation_store=self.conversation_store,
             settings=settings,
         )
 
@@ -132,3 +135,7 @@ def get_ask_service(request: Request) -> AskService:
 
 def get_document_service(request: Request) -> DocumentService:
     return _container(request).document_service
+
+
+def get_conversation_store(request: Request) -> ConversationStore:
+    return _container(request).conversation_store

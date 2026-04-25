@@ -25,12 +25,14 @@ class ResponseCache:
         document_ids: list[UUID] | None,
         model: str,
         prompt_version: str,
+        history_fingerprint: str = "",
     ) -> Answer | None:
         key = build_response_cache_key(
             question=question,
             document_ids=document_ids,
             model=model,
             prompt_version=prompt_version,
+            history_fingerprint=history_fingerprint,
         )
         try:
             raw = await self._redis.get(key)
@@ -52,12 +54,14 @@ class ResponseCache:
         model: str,
         prompt_version: str,
         answer: Answer,
+        history_fingerprint: str = "",
     ) -> None:
         key = build_response_cache_key(
             question=question,
             document_ids=document_ids,
             model=model,
             prompt_version=prompt_version,
+            history_fingerprint=history_fingerprint,
         )
         try:
             await self._redis.set(key, _serialize_answer(answer), ttl_seconds=self._ttl)

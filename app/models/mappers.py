@@ -68,7 +68,12 @@ def citation_to_response(citation: Citation) -> CitationResponse:
     )
 
 
-def answer_to_response(answer: Answer, request_id: str) -> AskResponse:
+def answer_to_response(
+    answer: Answer,
+    request_id: str,
+    *,
+    session_id: str,
+) -> AskResponse:
     return AskResponse(
         answer=answer.text,
         is_grounded=answer.is_grounded,
@@ -101,5 +106,6 @@ def answer_to_response(answer: Answer, request_id: str) -> AskResponse:
             )
             for inv in answer.tool_invocations
         ],
+        session_id=session_id,
         request_id=request_id,
     )
