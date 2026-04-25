@@ -377,6 +377,8 @@ If the corpus does contain relevant chunks but the LLM still refuses (Step-4 sel
 
 ## Architecture overview
 
+![High-level architecture: frontend → FastAPI backend with three request lanes (document management, session management, ask). The ask lane routes through regex/semantic-similarity classification to either a static reply (greeting/farewell/out-of-context) or a context answer that fans out to keyword (BM25) + vector (cosine) retrieval, fuses with RRF, reranks with an LLM, and reads/writes Postgres + FAISS + Redis](assets/architecture.png)
+
 ```
 HTTP route  →  service  →  pipeline  →  retriever / LLM client / vector store
                              ↓

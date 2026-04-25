@@ -2,64 +2,28 @@
 
 ## Overview
 
-A RAG assistant with a strict layered architecture:
+![High-level architecture: frontend hits a FastAPI backend that doubles as an MCP server with three request lanes — document management, session memory, and ask. The ask lane classifies the query, routes static intents (out-of-context / greeting / farewell) to a fixed reply, otherwise embeds and retrieves via BM25 (keyword) + cosine (vector) fused with RRF, reranks with an LLM, calls registered tools (calculator, list_documents) when needed, and reads/writes Postgres + FAISS + Redis](../assets/architecture.png)
 
-```
-HTTP route  →  service  →  pipeline  →  retriever / LLM client / vector store
-                             ↓
-                      domain models + prompts
-```
+The system is a **layered RAG pipeline**: every external system (OpenAI, FAISS, Postgres, Redis) sits behind a wrapper in `storages/`, `llm_clients/`, or `embedders/` so business logic never imports an SDK directly. Swapping a vendor = one new file under the matching folder.
 
-External systems (OpenAI, FAISS, Postgres, Redis) are always accessed through wrappers in `storages/`, `llm_clients/`, `embedders/`. Business logic never imports an SDK directly.
+### What each block does
 
-### Request flow — `/ask`
-
-```
-POST /api/v1/ask
-  ↓
-ask_routes.ask                          # Interface
-  ↓
-ask_service.ask                         # Application — validates, checks cache
-  ├─ response_cache.get                 # Short-circuit on hit
-  ↓
-query_pipeline.run                      # Pipeline orchestration
-  ├─ hybrid_retriever.retrieve          # Retrieval (dense + sparse)
-  │    ├─ vector_retriever              # OpenAI embedding → FAISS cosine
-  │    ├─ bm25_retriever                # Lexical BM25 over chunk text
-  │    └─ reciprocal_rank_fusion        # RRF fuses both ranked lists
-  ├─ reranker.rerank                    # LLM listwise rerank (top-N → top-K)
-  ├─ _trim_to_budget                    # Token-budget guard
-  ├─ openai_chat_client.complete        # CoT LLM call w/ retries
-  ├─ parse_response                     # Extract <thinking> + <answer>
-  └─ detect_refusal → build_answer      # Citation assembly
-  ↓
-response_cache.set                      # Persist grounded answers only
-  ↓
-answer_to_response                      # Mapper → HTTP DTO
-```
-
-### Request flow — `POST /documents` (ingestion)
-
-```
-POST /api/v1/documents  (multipart)
-  ↓
-document_routes.create_document
-  ↓
-document_service.create
-  ├─ validate_upload                    # Size + extension
-  ├─ sha256_bytes                       # content_hash for dedup/cache
-  ├─ repository.create (INGESTING)      # Persist metadata row
-  ↓
-ingest_pipeline.run
-  ├─ document_loader.load               # pypdf / utf-8/16/latin-1 decode
-  ├─ recursive_splitter.split           # Paragraph → sentence → token fallback
-  ├─ openai_embedder.embed_many         # Batched + embedding-cache
-  └─ faiss_store.upsert_chunks          # Deterministic chunk_id = "{doc_id}:{n}"
-  ↓
-repository.update_status (READY | FAILED + error_message)
-```
-
-Failure anywhere in `ingest_pipeline` marks the document `FAILED` with the error message — the DB row is always consistent with vector-store state.
+- **Frontend** — Server-rendered Jinja2 + HTMX UI at `http://localhost:8000/`. Sends three kinds of requests: upload/list/delete documents, ask a grounded question, manage the chat session. No npm, no separate dev server.
+- **Document Management** (`document_routes` → `DocumentService` → `IngestPipeline`) — Validates the upload, persists a `documents` row, splits with `RecursiveSplitter`, embeds chunks via `OpenAIEmbedder`, upserts into FAISS. The DB row's `status` always reflects vector-store state; failure anywhere in ingest marks it `FAILED` with an error message.
+- **Session** (`conversation_routes` → `ConversationStore`) — Stores the **last 3 user/assistant turns** per session in Redis (TTL 1 h). The `chat_session_id` HTTP-only cookie threads sessions across `/ask` calls; `DELETE /api/v1/sessions` clears it.
+- **Asks Request → Routing by Regex & Semantic Similarity** (`AskService` + `IntentClassifier`) — Two-layer fast path. Layer 1: literal-set lookup over ~25 normalized phrases (<1 ms, no network) catches the most common greetings/farewells. Layer 2: anything else gets embedded and compared by cosine to ~10 multilingual anchor phrases per class. If the closest anchor wins, return a static reply for $0; otherwise treat as a RAG query.
+- **Static Output** (Out of Context / Greetings / Farewell) — Fixed strings. `model="static"`, `cost=$0`. Greetings/farewells skip session storage so they don't push real Q&A out of the 3-turn window.
+- **Context Answer → Embedding Models** — For RAG queries, the same query embedding produced for classification is **reused** for retrieval (no second OpenAI call).
+- **Query Encoding (Keyword) — BM25** — Lexical retriever over `rank_bm25`. Catches exact keyword and rare-term matches that pure vector search misses. Returns `top_k * 3` candidates.
+- **Query Embedding — Cosine** — Vector retriever over FAISS `IndexFlatIP` with OpenAI `text-embedding-3-large` (3072-dim). Catches paraphrases that BM25 misses. Same `top_k * 3` candidate budget.
+- **RRF (BM25 + Cosine)** (`HybridRetriever`) — Reciprocal Rank Fusion (`k=60`) merges the two ranked lists into a single set. Pure math, no model needed.
+- **Backend + MCP Server (FastAPI)** — The central orchestrator. Builds the final prompt (system + last 3 turns + retrieved context + question), calls `OpenAIChatClient.complete` for plain answers or `complete_with_tools` when `enable_tools=true` (round-trips with the **Tool Registry** in an MCP-shaped tool-call loop, max 4 iterations). Returns the answer with citations, per-stage timings, token usage, and cost.
+- **Tool Registry** — MCP-shaped registry of typed tools. **Calculator** evaluates arithmetic safely via an AST walk (no `eval()`). **Get List Docs** returns the indexed corpus for meta-questions like *"what docs do I have?"*. Each tool declares a Pydantic args model, validated at registration; failures are captured as `ToolCallResult(ok=False, error=...)` and never break `/ask`.
+- **Reranker (LLM)** — Optional listwise reranker. One OpenAI call reorders top-N → top-K (`RERANK_TOP_K=4`). Reads candidate text from the **Vector Database** (FAISS metadata sidecar) and returns the chosen ordering. Gracefully degrades to fused order on parse failure.
+- **PostgreSQL** — Source of truth for document metadata (id, filename, chunk count, status, content hash, timestamps). Stores no chat history — that lives in Redis.
+- **Redis (Cache & Memory Management)** — Three caches share Redis: `ResponseCache` (final answers, key includes `system / user / rerank / tools / history-fp`), `EmbeddingCache` (chunk embeddings, 30-day TTL — re-uploads cost $0), `ConversationStore` (last-3-turn windows per session).
+- **Vector Database (FAISS)** — In-process file-backed `IndexFlatIP`. Async RWLock so concurrent `/ask` reads run in parallel (~3.7× speedup measured on 5 cold concurrent requests).
+- **Response** — Returned to the frontend as JSON; the chat bubble renders the answer, citation pills, per-stage latency footer (embed / retrieve / rerank / tool / complete), token count, and cost.
 
 ## Design decisions and trade-offs
 
@@ -498,12 +462,12 @@ Client-side `tiktoken` counts drift 1–5 tokens from the API's `usage.prompt_to
 
 Kept out of scope to stay within the 8–12h budget while hitting all core requirements:
 
-- **Chat UI** — bonus. OpenAPI Swagger at `/docs` is already interactive.
-- **Tool calling / MCP** — bonus. Not required for grounded Q&A.
-- **Integration tests** against live OpenAI / Postgres / Redis — covered by 91 unit tests on deterministic layers plus the live smoke tests documented in this file.
+- **Integration tests** against live OpenAI / Postgres / Redis — covered by 149 unit tests on deterministic layers plus the live smoke tests documented in this file.
 - **Streaming responses** — `gpt-5.4-2026-03-05` supports SSE but the API contract asks for a single response; streaming would require client changes.
+- **Rolling-summary memory** beyond the last 3 turns — for now we hard-drop turn 4+; a `summarize_turns_4_to_n()` step would be a one-method change in `ConversationStore.get()`.
+- **OCR fallback for scanned PDFs** — pypdf returns empty text on image-only PDFs and we don't currently route to Tesseract or a cloud OCR.
 
-All of these can be added within the existing architecture without refactoring.
+All of these can be added within the existing architecture without refactoring. The bonus items the assignment listed (chat UI, tool calling / MCP) **are** built — see the diagram and §15.
 
 ## Future improvements
 
