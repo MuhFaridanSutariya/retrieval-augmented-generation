@@ -4,7 +4,7 @@ from uuid import uuid4
 
 from app.enums.document_status import DocumentStatus
 from app.enums.file_type import FileType
-from app.models.domain.answer import Answer
+from app.models.domain.answer import Answer, StageTimings
 from app.models.domain.chunk import RetrievedChunk
 from app.models.domain.citation import Citation
 from app.models.domain.document import Document
@@ -107,3 +107,45 @@ def test_answer_to_response_maps_usage_and_request_id() -> None:
     assert response.usage.estimated_cost_usd == Decimal("0.016")
     assert response.request_id == "req-123"
     assert len(response.citations) == 1
+
+
+def test_answer_to_response_includes_stage_timings() -> None:
+    answer = Answer(
+        text="x",
+        is_grounded=True,
+        prompt_tokens=10,
+        completion_tokens=5,
+        estimated_cost_usd=Decimal("0"),
+        model="gpt-5.4",
+        prompt_version="system:simple-v4/user:simple-v4/rerank:1",
+        cache_hit=False,
+        timings=StageTimings(
+            embed_ms=812.34,
+            retrieve_ms=4.5,
+            rerank_ms=10456.7,
+            complete_ms=1234.56,
+            total_ms=12508.1,
+        ),
+    )
+    response = answer_to_response(answer, request_id="r1")
+    assert response.usage.timings.embed_ms == 812.3
+    assert response.usage.timings.retrieve_ms == 4.5
+    assert response.usage.timings.rerank_ms == 10456.7
+    assert response.usage.timings.complete_ms == 1234.6
+    assert response.usage.timings.total_ms == 12508.1
+
+
+def test_answer_to_response_defaults_timings_to_zero() -> None:
+    answer = Answer(
+        text="hi",
+        is_grounded=True,
+        prompt_tokens=0,
+        completion_tokens=0,
+        estimated_cost_usd=Decimal("0"),
+        model="static",
+        prompt_version="static:v1",
+        cache_hit=False,
+    )
+    response = answer_to_response(answer, request_id="r2")
+    assert response.usage.timings.total_ms == 0.0
+    assert response.usage.timings.rerank_ms == 0.0

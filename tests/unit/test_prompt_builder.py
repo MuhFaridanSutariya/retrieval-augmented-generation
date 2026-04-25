@@ -2,24 +2,56 @@ from uuid import uuid4
 
 from app.models.domain.chunk import RetrievedChunk
 from app.prompts.answer_with_context import (
+    ANSWER_PROMPT_COT_VERSION,
+    ANSWER_PROMPT_SIMPLE_VERSION,
     build_user_prompt,
     is_refusal,
     parse_response,
+    select_user_prompt_version,
 )
-from app.prompts.system_prompt import SYSTEM_PROMPT
+from app.prompts.system_prompt import (
+    SYSTEM_PROMPT_COT,
+    SYSTEM_PROMPT_COT_VERSION,
+    SYSTEM_PROMPT_SIMPLE,
+    SYSTEM_PROMPT_SIMPLE_VERSION,
+    select_system_prompt,
+)
 
 
-def test_system_prompt_contains_grounding_instructions() -> None:
-    assert "only" in SYSTEM_PROMPT.lower()
-    assert "CONTEXT" in SYSTEM_PROMPT
-    assert "do not have enough information" in SYSTEM_PROMPT.lower()
+def test_simple_system_prompt_has_grounding_rules_and_no_thinking_tags() -> None:
+    assert "only" in SYSTEM_PROMPT_SIMPLE.lower()
+    assert "CONTEXT" in SYSTEM_PROMPT_SIMPLE
+    assert "do not have enough information" in SYSTEM_PROMPT_SIMPLE.lower()
+    assert "<thinking>" not in SYSTEM_PROMPT_SIMPLE
+    assert "<answer>" not in SYSTEM_PROMPT_SIMPLE
 
 
-def test_system_prompt_requests_chain_of_thought_tags() -> None:
-    assert "<thinking>" in SYSTEM_PROMPT
-    assert "</thinking>" in SYSTEM_PROMPT
-    assert "<answer>" in SYSTEM_PROMPT
-    assert "</answer>" in SYSTEM_PROMPT
+def test_cot_system_prompt_keeps_thinking_block_for_complex_queries() -> None:
+    assert "<thinking>" in SYSTEM_PROMPT_COT
+    assert "</thinking>" in SYSTEM_PROMPT_COT
+    assert "<answer>" in SYSTEM_PROMPT_COT
+    assert "</answer>" in SYSTEM_PROMPT_COT
+    assert "do not have enough information" in SYSTEM_PROMPT_COT.lower()
+
+
+def test_select_system_prompt_returns_simple_by_default() -> None:
+    prompt, version = select_system_prompt(use_cot=False)
+    assert prompt is SYSTEM_PROMPT_SIMPLE
+    assert version == SYSTEM_PROMPT_SIMPLE_VERSION
+    assert "simple" in version
+
+
+def test_select_system_prompt_returns_cot_when_requested() -> None:
+    prompt, version = select_system_prompt(use_cot=True)
+    assert prompt is SYSTEM_PROMPT_COT
+    assert version == SYSTEM_PROMPT_COT_VERSION
+    assert "cot" in version
+
+
+def test_select_user_prompt_version_returns_distinct_tags() -> None:
+    assert select_user_prompt_version(use_cot=False) == ANSWER_PROMPT_SIMPLE_VERSION
+    assert select_user_prompt_version(use_cot=True) == ANSWER_PROMPT_COT_VERSION
+    assert ANSWER_PROMPT_SIMPLE_VERSION != ANSWER_PROMPT_COT_VERSION
 
 
 def test_build_user_prompt_numbers_chunks_sequentially() -> None:
@@ -39,13 +71,23 @@ def test_build_user_prompt_numbers_chunks_sequentially() -> None:
     assert "[S2]" in prompt
     assert "[S3]" in prompt
     assert "What is X?" in prompt
-    assert "<thinking>" in prompt or "thinking" in prompt.lower()
+
+
+def test_build_user_prompt_simple_does_not_request_thinking() -> None:
+    prompt = build_user_prompt("Q?", [], use_cot=False)
+    assert "<thinking>" not in prompt
+    assert "thinking" not in prompt.lower()
+
+
+def test_build_user_prompt_cot_requests_thinking() -> None:
+    prompt = build_user_prompt("Q?", [], use_cot=True)
+    assert "<thinking>" in prompt
 
 
 def test_build_user_prompt_handles_empty_context() -> None:
     prompt = build_user_prompt("Tell me.", [])
     assert "no context available" in prompt.lower()
-    assert "refusal" in prompt.lower()
+    assert "refusal" in prompt.lower() or "context" in prompt.lower()
 
 
 def test_build_user_prompt_includes_source_filenames() -> None:

@@ -5,6 +5,15 @@ from app.models.domain.citation import Citation
 
 
 @dataclass(slots=True)
+class StageTimings:
+    embed_ms: float = 0.0
+    retrieve_ms: float = 0.0
+    rerank_ms: float = 0.0
+    complete_ms: float = 0.0
+    total_ms: float = 0.0
+
+
+@dataclass(slots=True)
 class Answer:
     text: str
     citations: list[Citation] = field(default_factory=list)
@@ -17,3 +26,4 @@ class Answer:
     model: str = ""
     prompt_version: str = ""
     cache_hit: bool = False
+    timings: StageTimings = field(default_factory=StageTimings)

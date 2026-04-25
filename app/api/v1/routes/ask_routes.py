@@ -17,5 +17,7 @@ async def ask(
         question=payload.question,
         document_ids=payload.document_ids,
         top_k=payload.top_k,
+        use_cot=payload.enable_cot,
+        use_rerank=payload.enable_rerank,
     )
     return answer_to_response(result.answer, result.request_id)

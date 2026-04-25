@@ -3,7 +3,8 @@ from dataclasses import dataclass
 
 from app.models.domain.chunk import RetrievedChunk
 
-ANSWER_PROMPT_VERSION = "v2"
+ANSWER_PROMPT_SIMPLE_VERSION = "simple-v4"
+ANSWER_PROMPT_COT_VERSION = "cot-v3"
 
 REFUSAL_SENTENCE = (
     "I do not have enough information in the provided documents to answer that."
@@ -23,14 +24,24 @@ class ParsedResponse:
     reasoning: str | None
 
 
-def build_user_prompt(question: str, chunks: list[RetrievedChunk]) -> str:
+def build_user_prompt(
+    question: str,
+    chunks: list[RetrievedChunk],
+    *,
+    use_cot: bool = False,
+) -> str:
     if not chunks:
-        return (
-            f"CONTEXT:\n(no context available)\n\n"
-            f"QUESTION:\n{question}\n\n"
-            "Reason step by step inside <thinking>, then emit the refusal sentence "
-            "inside <answer>."
-        )
+        if use_cot:
+            tail = (
+                "Reason step by step inside <thinking>, then emit the refusal sentence "
+                "inside <answer>."
+            )
+        else:
+            tail = (
+                "Answer only from CONTEXT. If no context is available, respond with the "
+                "refusal sentence."
+            )
+        return f"CONTEXT:\n(no context available)\n\nQUESTION:\n{question}\n\n{tail}"
 
     context_blocks: list[str] = []
     for position, chunk in enumerate(chunks, start=1):
@@ -40,12 +51,18 @@ def build_user_prompt(question: str, chunks: list[RetrievedChunk]) -> str:
         )
 
     context = "\n\n".join(context_blocks)
-    return (
-        f"CONTEXT:\n{context}\n\n"
-        f"QUESTION:\n{question}\n\n"
-        "Reason step by step inside <thinking>, then give the final answer inside <answer>. "
-        "Cite snippets as [S1], [S2], etc."
-    )
+    if use_cot:
+        tail = (
+            "Reason step by step inside <thinking>, then give the final answer inside "
+            "<answer>. Cite snippets as [S1], [S2], etc."
+        )
+    else:
+        tail = "Answer using only the CONTEXT above. Cite snippets as [S1], [S2], etc."
+    return f"CONTEXT:\n{context}\n\nQUESTION:\n{question}\n\n{tail}"
+
+
+def select_user_prompt_version(*, use_cot: bool) -> str:
+    return ANSWER_PROMPT_COT_VERSION if use_cot else ANSWER_PROMPT_SIMPLE_VERSION
 
 
 def parse_response(raw: str) -> ParsedResponse:

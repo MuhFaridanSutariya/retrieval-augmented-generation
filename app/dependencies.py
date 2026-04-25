@@ -17,6 +17,7 @@ from app.services.document_service import DocumentService
 from app.storages.database import Database
 from app.storages.faiss_store import FaissStore
 from app.storages.redis_store import RedisStore
+from app.validators.intent_classifier import IntentClassifier
 
 
 class Container:
@@ -51,6 +52,10 @@ class Container:
             chat_client=self.chat_client,
             settings=settings,
         )
+        self.intent_classifier = IntentClassifier(
+            embedder=self.embedder,
+            settings=settings,
+        )
 
         self.ingest_pipeline = IngestPipeline(
             splitter=self.splitter,
@@ -75,6 +80,8 @@ class Container:
             database=self.database,
             query_pipeline=self.query_pipeline,
             response_cache=self.response_cache,
+            embedder=self.embedder,
+            intent_classifier=self.intent_classifier,
             settings=settings,
         )
 

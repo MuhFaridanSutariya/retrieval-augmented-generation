@@ -1,0 +1,51 @@
+<section id="documents" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+    <div class="flex items-center justify-between mb-3">
+        <h2 class="text-base font-semibold">Documents</h2>
+        <span class="text-xs text-slate-400">{{ documents|length }} indexed</span>
+    </div>
+
+    {% if not documents %}
+    <p class="text-sm text-slate-400 italic">No documents yet. Upload one above.</p>
+    {% else %}
+    <ul class="space-y-2">
+        {% for doc in documents %}
+        <li class="border border-slate-100 rounded-lg p-3 {% if latest_id and doc.id|string == latest_id %}ring-2 ring-amber-300 bg-amber-50{% endif %}">
+            <div class="flex items-start justify-between gap-2">
+                <div class="min-w-0 flex-1">
+                    <p class="text-sm font-medium truncate" title="{{ doc.filename }}">{{ doc.filename }}</p>
+                    <div class="text-xs text-slate-500 mt-0.5 flex items-center gap-2 flex-wrap">
+                        <span class="uppercase tracking-wide">{{ doc.file_type.value }}</span>
+                        <span>·</span>
+                        <span>{{ "{:,}".format(doc.size_bytes) }} B</span>
+                        <span>·</span>
+                        <span>{{ doc.chunk_count }} chunks</span>
+                    </div>
+                </div>
+                <div>
+                    {% set status = doc.status.value %}
+                    {% if status == "READY" %}
+                        <span class="inline-flex items-center gap-1 bg-emerald-100 text-emerald-800 text-[11px] font-semibold px-2 py-0.5 rounded">● READY</span>
+                    {% elif status == "INGESTING" %}
+                        <span class="inline-flex items-center gap-1 bg-amber-100 text-amber-800 text-[11px] font-semibold px-2 py-0.5 rounded">⌛ INGESTING</span>
+                    {% elif status == "UPLOADED" %}
+                        <span class="inline-flex items-center gap-1 bg-slate-100 text-slate-700 text-[11px] font-semibold px-2 py-0.5 rounded">UPLOADED</span>
+                    {% elif status == "FAILED" %}
+                        <span class="inline-flex items-center gap-1 bg-rose-100 text-rose-800 text-[11px] font-semibold px-2 py-0.5 rounded">⚠ FAILED</span>
+                    {% endif %}
+                </div>
+            </div>
+            {% if doc.error_message %}
+            <p class="mt-2 text-[11px] text-rose-700 bg-rose-50 rounded px-2 py-1">{{ doc.error_message }}</p>
+            {% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    <button
+        hx-get="/web/documents"
+        hx-target="#documents"
+        hx-swap="outerHTML"
+        class="mt-3 w-full text-xs text-slate-500 hover:text-slate-900"
+    >Refresh list</button>
+</section>

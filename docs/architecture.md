@@ -155,30 +155,60 @@ prompt_version, model
 
 `query_hash` is the first 16 hex chars of `sha256(normalized_query)`. Full queries/responses only log when `LOG_VERBOSE=true`. This means the assignment's observability requirement is met without leaking user content by default.
 
-### 10. Chain-of-Thought prompting with structured output (v2 prompts)
+### 10. Prompt modes — Simple by default, CoT on demand
 
-The `SYSTEM_PROMPT` (version `v2`) instructs the model to emit:
+We support **two prompt variants**, selected per-request via a boolean flag (`enable_cot` in `AskRequest`, an HTML checkbox in the FE form). The default is the simpler one.
 
+| | Simple (default, `simple-v4`) | CoT (`cot-v3`) |
+|---|---|---|
+| System prompt | Grounding rules + refusal sentence + English-only — that's it | Same rules **plus** structured `<thinking>` + `<answer>` tag protocol with a 4-step self-check |
+| User prompt tail | `"Answer using only the CONTEXT above."` | `"Reason step by step inside <thinking>, then give the final answer inside <answer>."` |
+| Completion tokens (measured) | ~30–50 | ~200–300 |
+| Cost / RAG query (measured) | $0.0046 | $0.0087 |
+| Latency (rough) | baseline | +1–2 s of generation |
+| Best for | Single-fact lookups, definitions, simple Q&A | Multi-hop reasoning, comparisons, "why" questions |
+
+**Why a toggle rather than always-on CoT:**
+
+After measuring v3 in production we found that:
+
+- For straightforward fact lookups, simple-mode and CoT produce identical answers ~95% of the time.
+- CoT makes ~5× the output tokens at ~2× the cost per query.
+- Modern gpt-5.4 grounds reliably without externalized reasoning when the prompt is strict.
+
+So we made simple the default and left CoT one-click away for queries that genuinely benefit.
+
+**Rerank toggle** — alongside CoT, the FE also exposes a **🎯 Smart context selection** checkbox bound to `enable_rerank`. On by default; turning it off skips the LLM-rerank stage in the pipeline (`use_rerank=False` short-circuits past `LLMReranker.rerank()`).
+
+**Cache key composition.** The response-cache key includes the full prompt-version string `system:{simple|cot}/user:{simple|cot}/rerank:{0|1}`. That gives four mutually-isolated cache buckets — the four combinations of (CoT, rerank) on/off — each invalidated independently when its prompt version is bumped.
+
+### 14b. Per-stage latency instrumentation
+
+Every `Answer` carries a `StageTimings` object measured at the boundaries between pipeline stages:
+
+```python
+@dataclass(slots=True)
+class StageTimings:
+    embed_ms: float = 0.0       # ask_service — query embed for intent + retrieval cache
+    retrieve_ms: float = 0.0    # query_pipeline — hybrid retrieve (vector + BM25 + RRF)
+    rerank_ms: float = 0.0      # query_pipeline — LLM rerank (0 if disabled or short-circuited)
+    complete_ms: float = 0.0    # query_pipeline — final LLM completion
+    total_ms: float = 0.0       # ask_service — wall clock
 ```
-<thinking>
-Step 1. Identify entities in the question.
-Step 2. List context snippets that are actually relevant.
-Step 3. Decide whether the snippets support an answer.
-Step 4. Double-check every claim has a [Sn] citation.
-</thinking>
 
-<answer>
-The user-facing answer, with [Sn] citations inline.
-</answer>
-```
+Surfaced in `UsageResponse.timings` and rendered as a small monospace footer line in the chat UI under each bubble. Three reasons it earns its keep:
 
-**Why structured CoT rather than "think step by step" in free prose:**
-- Reasoning is extracted (`parse_response()`) and logged as `reasoning` when `LOG_VERBOSE=true`, never returned to the client — users see a clean answer.
-- The Step-4 self-check materially reduces unsupported claims: the model re-reads its draft against the context before emitting it.
-- Parse is robust to mistakes — if the model forgets the `<answer>` tag, we take everything after `</thinking>`; if it skips the tags entirely, we treat the whole response as the answer. Never raises.
-- Prompt version is part of the response-cache key — bumping to v2 invalidated v1 answers automatically.
+1. **Diagnoses where latency lives.** When total is 30 s and `complete_ms` is only 2 s, you immediately know the LLM isn't the bottleneck.
+2. **Shows the impact of toggles.** Flipping CoT on doubles `complete_ms` (live-measured: 1.8 s simple → 5.4 s CoT on the same query). Flipping rerank shifts time into `rerank_ms`.
+3. **Surfaces real bugs.** This instrumentation immediately revealed that the embedding cache may not always be hitting on the in-pipeline embed: `retrieve_ms` ≈ 8 s suggests `vector_retriever`'s `embed_single("question")` is missing the cache that `ask_service` just populated. Tracked as a follow-up.
 
-**Cost impact:** completion tokens roughly 3-4x larger than v1 (≈200 vs ≈40) because the model now writes the thinking block. Observed per-query cost rose from ~$0.016 to ~$0.007-0.012 with the smaller corpus. Still dominated by input tokens.
+**Defensive parsing.** `parse_response()` in `prompts/answer_with_context.py` strips `<thinking>` and `<answer>` tags whether or not they're requested:
+- Simple mode usually has no tags → parser returns the raw text untouched.
+- CoT mode has tags → reasoning is extracted into `Answer.reasoning` (logged when `LOG_VERBOSE=true`, never returned to clients), answer is extracted from the `<answer>` block.
+- Models occasionally emit tags even in simple mode → parser strips them silently.
+- Models occasionally nest tags or forget closing tags → parser falls back to permissive heuristics, never raises.
+
+The FE shows a small **🧠 CoT** pill on bubbles produced in CoT mode so users can see which prompt produced each answer.
 
 ### 11. Accuracy — hybrid retrieval + LLM reranking
 
@@ -269,7 +299,89 @@ The two outputs are concatenated per page (`prose + "\n\n" + table_md_1 + "\n\n"
 
 **Acknowledged limitations** (see "What was intentionally not built" below): we don't OCR scanned/image-only PDFs, don't extract chart data from images, and pypdf can interleave columns in heavy multi-column layouts. The upgrade path is documented (Tesseract OCR fallback + vision-LLM for charts).
 
-### 14. Dependency wiring — one composition root
+### 14. Intent classification — embedding anchors, not an LLM router
+
+The naive `/ask` flow always runs the full retrieval + rerank + LLM stack — even for `"halo"`. That wastes time and money on three buckets of input the assistant doesn't need an LLM to handle:
+
+| Intent | Example | What we want |
+|---|---|---|
+| **Greeting** | `"halo"`, `"hi there"`, `"good morning"`, `"hola"` | Friendly fixed reply, no retrieval, no LLM |
+| **Farewell** | `"thanks"`, `"bye"`, `"grazie ciao"` | Friendly fixed reply, no retrieval, no LLM |
+| **Off-topic** | `"What is the capital of Argentina?"` against an SLA-report corpus | Polite "I don't have that in your docs" — soft refusal, not HTTP 404 |
+| **RAG query** | `"What was the p95 latency in Q1 2026?"` | The full pipeline |
+
+Greetings and farewells are classified **before** retrieval and short-circuited; off-topic is detected **after** retrieval (no chunks pass the relevance floor). Both static paths return `model="static"`, `cost=$0`, and a typed `refusal_reason` so the UI/API can render them differently.
+
+#### Why embedding anchors, not a small LLM router
+
+A common alternative is to route every incoming query through a cheap LLM (e.g. `gpt-5.4-nano`) with a classification prompt. We considered it explicitly and chose embedding anchors. Reasons in priority order:
+
+1. **Latency budget.** An LLM router adds **200–800 ms to every `/ask`**, including cache hits and greetings. Embedding-cosine classification is local matrix math — **<1 ms** after the query embedding completes, and the embedding is the same one we use for retrieval, so there's no extra OpenAI call.
+2. **Cost on the wrong side.** ~5% of queries are greetings/farewells; ~95% are RAG. An LLM router pays the routing cost on **100%** of queries to filter out the 5%. Anchors pay $0 per query.
+3. **Reliability.** A router LLM is a hard dependency on the chat path. If OpenAI rate-limits or times out, every query fails. Anchors are local NumPy — no network failure mode.
+4. **Determinism.** Same input always produces the same classification with anchors. LLM routers can drift across model versions and adversarial edge cases.
+5. **OFF_TOPIC isn't a pre-retrieval problem anyway.** A pre-retrieval LLM router can't reliably classify `"What is photosynthesis?"` as off-topic without seeing the corpus. The signal we actually need (no relevant chunks) only exists *after* retrieval — so the router can't add value there.
+6. **The flexibility argument.** Earlier in the build we considered (and rejected) a regex classifier as too rigid. Embeddings ARE the flexible answer: `"halo"`, `"ciao"`, `"howdy"`, `"namaste"`, `"sup"`, `"hi 👋"` all land in the same semantic neighborhood as the 10 anchor phrases. We get language-agnostic robustness without any pattern-matching code.
+
+The trade-off: anchors require a small predefined set of canonical examples (~10 per class). That's a one-time, ~20-line code edit — not an ongoing cost.
+
+#### When an LLM router would be the right call
+
+- Multi-turn conversational agent with complex intents (booking flows, customer support, mixed greeting+RAG turns).
+- Latency budget is loose (>1 s per turn is fine).
+- You need to disambiguate >5 intents that don't fall into clean semantic clusters.
+- You're already paying for an LLM router for other reasons (e.g. tool routing).
+
+For our single-turn grounded Q&A under a tight latency budget, anchors win cleanly.
+
+#### Implementation — three-layer pipeline
+
+The classifier is structured so common greetings and farewells **never touch the network**:
+
+**Layer 1 — `fast_path_classify(question) -> Intent | None`** (literal-set lookup, <1 ms, zero network)
+
+- `_FAST_GREETINGS` and `_FAST_FAREWELLS` are `frozenset[str]` — ~25 canonical literal phrases each.
+- Normalize: `question.strip().rstrip("!.?,;:").strip().lower()`. (Built-in `str` methods, no regex.)
+- If the normalized string is in either set, return the corresponding `Intent`. Otherwise `None` → fall through to Layer 2.
+- This is a **memoization cache** for the most common literal queries. It does not reduce expressiveness; anything not in the set still runs through Layer 2.
+
+**Layer 2 — embedding-anchor classifier** (semantic similarity, <1 ms after embed)
+
+- `GREETING_ANCHORS` and `FAREWELL_ANCHORS`: tuples of ~10 canonical phrases each, deliberately multilingual (English, Italian, Spanish, French, Hindi, Japanese, German).
+- Anchors embedded via `OpenAIEmbedder.embed_many()` and persisted to Redis via the existing `EmbeddingCache` — so subsequent app restarts skip OpenAI entirely (~5–10 ms read from Redis).
+- Public `warm()` method, called from FastAPI's `lifespan`, eagerly loads anchors at startup so the first user query never pays the warm-up cost.
+- `classify(query_embedding) -> Intent`: matrix-vector product → max cosine per class → compare to `INTENT_CLASSIFICATION_THRESHOLD=0.55`. Below threshold → `RAG_QUERY`.
+
+**Layer 3 — post-retrieval soft refusal** for `RAG_QUERY` cases where retrieval finds nothing relevant: `ask_service` catches `NoRelevantContext` and returns a static off-topic answer (`is_grounded=False`, `refusal_reason="off_topic"`). HTTP 200, not 404.
+
+`app/services/ask_service.py` orchestrates all three:
+
+```
+validate → fast_path_classify (Layer 1)
+           ↓ None (not a literal match)
+         embed query → classifier.classify (Layer 2)
+           ↓ RAG_QUERY
+         retrieve → rerank → LLM
+           ↓ NoRelevantContext caught (Layer 3)
+         soft off-topic answer
+```
+
+For `GREETING`/`FAREWELL` from any layer, the response has `model="static"`, `cost=Decimal("0")` — no LLM call, no retrieval. The `Intent` value is logged via `RequestMetrics` for observability.
+
+#### Verified live (latencies measured on the user's network)
+
+```
+"halo"          → Layer 1 (fast-path)   → 0.21 s   (was 8 s — 38× faster, zero network)
+"thanks bye"    → Layer 1 (fast-path)   → 0.21 s
+"grazie ciao"   → Layer 2 (embedding)   → 10.7 s   (multi-word; not in fast-path)
+"hola amigo"    → Layer 2 (embedding)   → 8.7 s    (extra word; not in fast-path)
+"What is the capital of Argentina?" → Layer 3 → grounded=false, refusal="off_topic"
+"p95 latency Q1?"                    → Full RAG → grounded=true, cost=$0.0088
+```
+
+Single-word common phrases hit Layer 1 and bypass OpenAI entirely. Multi-word variants fall through to Layer 2 — slower (one OpenAI embed call) but still semantically correct and still `cost=$0` because the LLM is never invoked. Real RAG queries flow through unchanged.
+
+### 15. Dependency wiring — one composition root
 
 `app/dependencies.py` is the only place that instantiates clients. Everything else receives dependencies via constructor (services, pipelines, retrievers). `Container` is built once during FastAPI `lifespan`, attached to `app.state`, and resolved per-request via `get_*` functions.
 

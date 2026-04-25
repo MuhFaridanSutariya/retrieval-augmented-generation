@@ -1,0 +1,66 @@
+<div class="space-y-4">
+    {# User bubble #}
+    <div class="flex justify-end">
+        <div class="max-w-[85%] bg-slate-900 text-white rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm">
+            {{ question }}
+        </div>
+    </div>
+
+    {# Assistant bubble #}
+    <div class="flex justify-start">
+        <div class="max-w-[85%] bg-slate-100 rounded-2xl rounded-tl-sm px-4 py-3 text-sm space-y-2">
+            {% if error %}
+                <p class="text-rose-700 font-medium">{{ error.type }}</p>
+                <p class="text-rose-700 text-xs">{{ error.message }}</p>
+            {% else %}
+                <div class="whitespace-pre-wrap leading-relaxed">{{ answer.text }}</div>
+
+                {% if answer.citations %}
+                <div class="pt-2 mt-2 border-t border-slate-200 flex flex-wrap gap-1.5">
+                    {% for citation in answer.citations %}
+                    <span
+                        class="citation-pill inline-flex items-center gap-1 bg-slate-200 hover:bg-amber-200 text-slate-800 text-[11px] font-medium px-2 py-0.5 rounded cursor-help"
+                        title="{{ citation.snippet }}"
+                    >
+                        [S{{ loop.index }}] {{ citation.filename }}
+                        <span class="text-slate-500">· chunk {{ citation.chunk_index }}</span>
+                    </span>
+                    {% endfor %}
+                </div>
+                {% endif %}
+
+                <div class="pt-1 text-[11px] text-slate-500 flex flex-wrap gap-x-3 gap-y-0.5">
+                    {% if not answer.is_grounded %}
+                    <span class="text-amber-700 font-semibold">⚠ Not grounded</span>
+                    {% endif %}
+                    {% if answer.cache_hit %}
+                    <span class="text-emerald-700">✓ cache hit</span>
+                    {% endif %}
+                    {% if "cot" in (answer.prompt_version or "")|lower %}
+                    <span class="text-indigo-700 font-semibold" title="Chain-of-Thought mode">🧠 CoT</span>
+                    {% endif %}
+                    {% if "rerank:1" in (answer.prompt_version or "") %}
+                    <span class="text-purple-700 font-semibold" title="Smart context selection: an extra LLM call re-ranked the retrieved snippets">🎯 reranked</span>
+                    {% endif %}
+                    <span>{{ answer.prompt_tokens + answer.completion_tokens }} tokens</span>
+                    <span>${{ "%.6f"|format(answer.estimated_cost_usd) }}</span>
+                    {% if request_id %}
+                    <span class="text-slate-400" title="request_id">req: {{ request_id[:8] }}…</span>
+                    {% endif %}
+                </div>
+
+                {% set timings = answer.timings %}
+                {% if timings and timings.total_ms %}
+                <div class="text-[10px] text-slate-400 font-mono flex flex-wrap gap-x-3 gap-y-0.5"
+                     title="Latency breakdown by stage. The reranker LLM call and embed call are usually the largest slices.">
+                    <span>total {{ "%.0f"|format(timings.total_ms) }}ms</span>
+                    {% if timings.embed_ms %}<span>embed {{ "%.0f"|format(timings.embed_ms) }}</span>{% endif %}
+                    {% if timings.retrieve_ms %}<span>retrieve {{ "%.0f"|format(timings.retrieve_ms) }}</span>{% endif %}
+                    {% if timings.rerank_ms %}<span>rerank {{ "%.0f"|format(timings.rerank_ms) }}</span>{% endif %}
+                    {% if timings.complete_ms %}<span>complete {{ "%.0f"|format(timings.complete_ms) }}</span>{% endif %}
+                </div>
+                {% endif %}
+            {% endif %}
+        </div>
+    </div>
+</div>

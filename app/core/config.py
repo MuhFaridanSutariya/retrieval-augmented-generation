@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     faiss_metadata_path: str = "data/index/metadata.json"
     faiss_oversample_factor: int = 5
 
+    intent_classification_threshold: float = 0.55
+
     chunk_size_tokens: int = 500
     chunk_overlap_tokens: int = 50
     retrieval_top_k: int = 8

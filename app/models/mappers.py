@@ -5,7 +5,12 @@ from app.models.domain.chunk import RetrievedChunk
 from app.models.domain.citation import Citation
 from app.models.domain.document import Document
 from app.models.orm.document_orm import DocumentORM
-from app.models.schema.ask_schema import AskResponse, CitationResponse, UsageResponse
+from app.models.schema.ask_schema import (
+    AskResponse,
+    CitationResponse,
+    StageTimingsResponse,
+    UsageResponse,
+)
 from app.models.schema.document_schema import DocumentResponse
 
 
@@ -75,6 +80,13 @@ def answer_to_response(answer: Answer, request_id: str) -> AskResponse:
             estimated_cost_usd=answer.estimated_cost_usd,
             model=answer.model,
             cache_hit=answer.cache_hit,
+            timings=StageTimingsResponse(
+                embed_ms=round(answer.timings.embed_ms, 1),
+                retrieve_ms=round(answer.timings.retrieve_ms, 1),
+                rerank_ms=round(answer.timings.rerank_ms, 1),
+                complete_ms=round(answer.timings.complete_ms, 1),
+                total_ms=round(answer.timings.total_ms, 1),
+            ),
         ),
         request_id=request_id,
     )

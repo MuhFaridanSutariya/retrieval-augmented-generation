@@ -2,7 +2,7 @@
 
 A production-like RAG-based AI assistant that answers questions grounded **only** in the documents you upload.
 
-- **LLM:** OpenAI `gpt-5.4-2026-03-05` with Chain-of-Thought structured prompting (v3, English-only output)
+- **LLM:** OpenAI `gpt-5.4-2026-03-05` with grounded English-only prompting; **simple prompt by default** (~$0.005/query) with an opt-in **Chain-of-Thought toggle** for complex multi-hop questions (~$0.009/query)
 - **Embeddings:** OpenAI `text-embedding-3-large` (3072 dim)
 - **Retrieval:** Hybrid — vector (FAISS) + BM25 (rank-bm25) fused via Reciprocal Rank Fusion, then LLM listwise reranked
 - **Vector store:** FAISS (local, file-backed, zero-service)
@@ -10,6 +10,7 @@ A production-like RAG-based AI assistant that answers questions grounded **only*
 - **Cache:** Redis (response + embedding caches)
 - **Concurrency:** async read-write lock over FAISS so `/ask` calls run in parallel (~3.7× speedup measured on 5 cold concurrent requests)
 - **API:** FastAPI
+- **Web UI:** Server-rendered Jinja2 + HTMX + Tailwind (CDN). No npm, no separate dev server, no build step — the FE lives in the same FastAPI process at `http://localhost:8000/`
 
 ## Prerequisites
 
@@ -151,20 +152,134 @@ curl -X POST http://localhost:8000/api/v1/ask \
   }'
 ```
 
+## Intent handling — greetings, farewells, off-topic
+
+Not every message is a RAG query. The assistant classifies each incoming question into one of four intents and routes accordingly:
+
+| Intent | Routed to | Cost | `model` field | `is_grounded` | `refusal_reason` |
+|---|---|---|---|---|---|
+| Greeting (`"halo"`, `"hi there"`, `"ciao"`) | Static reply | $0 | `static` | `true` | `null` |
+| Farewell (`"thanks bye"`, `"grazie"`) | Static reply | $0 | `static` | `true` | `null` |
+| Off-topic (no relevant chunks found) | Soft refusal | $0 | `static` | `false` | `off_topic` |
+| RAG query | Full hybrid + rerank + LLM pipeline | ~$0.007–0.018 | `gpt-5.4-2026-03-05` | true / false | `null` or `no_relevant_context_in_corpus` |
+
+**Greeting/farewell classification** uses a **two-layer pipeline**:
+
+| Layer | What | Latency | When it triggers |
+|---|---|---|---|
+| **1. Fast-path** | `frozenset` literal lookup over ~25 common phrases (`"halo"`, `"hi"`, `"thanks bye"`, `"grazie"`, …). Input is normalized: lowercased, trailing punctuation stripped, **runs of 3+ identical letters collapsed to one** (`holaaaaa` → `hola`, `byeeee` → `bye`) | **<1 ms, zero network** | Exact normalized match — also catches casual elongations |
+| **2. Embedding classifier** | Cosine similarity to ~10 anchor phrases per class, multilingual (Italian, Spanish, French, Hindi, Japanese, German) | <1 ms after embed (one OpenAI call) | Anything not in the fast-path set |
+
+Layer 1 is a **memoization cache**, not a classifier — anything not in the set still falls through to Layer 2's flexible embedding match, so multilingual coverage and paraphrase tolerance are preserved.
+
+Anchors are embedded once on app startup (eager `warm()` from FastAPI's `lifespan`) and persisted to Redis via the existing embedding cache — subsequent restarts skip OpenAI entirely.
+
+We picked this two-layer setup over a small LLM router for four reasons:
+
+1. **Latency** — fast-path is <1 ms (no network). Embedding fallback is <1 ms after embed. An LLM router adds 200–800 ms (or more on slow networks) to every `/ask`, including cache hits.
+2. **Cost** — both layers are $0/query at runtime; an LLM router pays a routing fee on 100% of queries to filter out the ~5% that are non-RAG.
+3. **Reliability** — fast-path is in-process; embedding-anchor cosine is local NumPy. An LLM router is a hard dependency on the chat path.
+4. **Off-topic isn't a pre-retrieval problem** — you can't classify a question as off-topic without seeing the corpus. We handle that *after* retrieval (no chunks above the relevance floor → soft refusal).
+
+**Measured live:**
+- `"halo"`: **8 s → 0.21 s** (38× faster, fast-path hit)
+- `"holaaaaaaaaaaa"`: **8 s → 0.21 s** (collapse rule maps to `hola`, fast-path hit)
+- `"hellooooo"`, `"thxxxxx"`, `"byeeeee"`: all **<0.25 s**
+
+See [docs/architecture.md §14](docs/architecture.md) for the full design rationale and verified-live results.
+
+## Two UI toggles for accuracy / cost / latency
+
+Both toggles live under the chat input. Each maps to a request flag (and a column in the cache key, so toggling never returns a stale answer from another mode):
+
+| Toggle | Request field | Default | What it does | Cost / latency hit |
+|---|---|---|---|---|
+| **🎯 Smart context selection** | `enable_rerank` | **on** | Runs an extra LLM call to re-rank retrieved snippets and pick the most relevant ones | +1 LLM call (~1–10 s on slow networks); ~$0.002–0.005/query |
+| **🧠 Chain-of-Thought mode** | `enable_cot` | off | Asks the model to reason step by step inside `<thinking>` tags; FE strips reasoning before render | ~5× output tokens (~$0.003 extra/query); +1–3 s of generation |
+
+API control:
+```bash
+curl -X POST http://localhost:8000/api/v1/ask \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "Why did Q1 cost rise vs Q4, and which line items drove it?",
+    "enable_cot": true,
+    "enable_rerank": true
+  }'
+```
+
+Server defaults come from `RERANK_ENABLED` in `.env`. Per-request `enable_rerank: null` (the default for API consumers who don't send the field) falls back to the server setting.
+
+### Per-stage timing in every response
+
+Every `/ask` response includes a `usage.timings` object so you can see where time is going:
+
+```json
+"timings": {
+  "embed_ms": 8690.0,
+  "retrieve_ms": 8689.0,
+  "rerank_ms": 0.0,
+  "complete_ms": 5380.0,
+  "total_ms": 27150.0
+}
+```
+
+The chat UI shows these in a small monospace footer line under each bubble. Useful for telling at a glance *where* the latency is — e.g. complete=5400ms means the LLM is slow, embed=8000ms means the network to OpenAI is slow.
+
+## Prompt modes — Simple (default) vs Chain-of-Thought (opt-in)
+
+The `/ask` endpoint runs in **simple mode** by default — minimal grounding rules, refusal sentence, English-only output. Set `enable_cot: true` (or check the **🧠 Chain-of-Thought mode** box in the UI) to switch to a structured CoT prompt with explicit reasoning steps.
+
+Both modes share the same retrieval, reranking, and citation rules. They differ only in the system + user prompt the LLM sees.
+
+| | Simple (default) | CoT (opt-in) |
+|---|---|---|
+| Prompt version | `simple-v4` | `cot-v3` |
+| Output format | Direct answer + citations | `<thinking>` block + `<answer>` block; FE strips reasoning |
+| Completion tokens (measured) | ~30–50 | ~200–300 |
+| Cost / RAG query (measured) | **~$0.005** | **~$0.009** |
+| Best for | Single-fact lookups, definitions, short facts from one chunk | Multi-hop reasoning, comparing chunks, cross-checking facts |
+
+**Cache key includes the prompt version**, so toggling the flag never returns a stale answer from the other mode.
+
+```bash
+# Default (simple)
+curl -X POST http://localhost:8000/api/v1/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What was the p95 latency in Q1 2026?"}'
+
+# Opt-in to CoT
+curl -X POST http://localhost:8000/api/v1/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Why did Q1 2026 cost rise vs Q4 2025, and which line items drove it most?", "enable_cot": true}'
+```
+
+The chat UI footer shows a **🧠 CoT** badge on bubbles produced in CoT mode so you can see at a glance which prompt produced each answer.
+
 ## Behaviour when context is missing
 
-If no chunk in the corpus is relevant enough (below `MIN_RELEVANCE_SCORE`) or the LLM refuses, the response is:
+If no chunk in the corpus passes the relevance floor, the request returns **HTTP 200** with a soft refusal:
+```json
+{
+  "answer": "I don't have anything in your uploaded documents about that. Try uploading a relevant document, or ask a question that's covered by your existing corpus.",
+  "is_grounded": false,
+  "refusal_reason": "off_topic",
+  "citations": [],
+  "usage": { "model": "static", "estimated_cost_usd": "0", ... }
+}
+```
+
+If the corpus does contain relevant chunks but the LLM still refuses (Step-4 self-check failed), the response is:
 ```json
 {
   "answer": "I do not have enough information in the provided documents to answer that.",
   "is_grounded": false,
   "refusal_reason": "no_relevant_context_in_corpus",
-  "citations": [],
   ...
 }
 ```
 
-The route returns **HTTP 404** for `NoRelevantContext` and **HTTP 400** for empty queries.
+`POST /api/v1/ask` returns **HTTP 400** for empty queries via `EmptyQuery`.
 
 ## Architecture overview
 
@@ -261,15 +376,37 @@ No bare `except:` anywhere. Infra errors never leak vendor tracebacks to clients
    ```bash
    uv run uvicorn app.main:app --reload
    ```
-   API on http://localhost:8000. OpenAPI docs at http://localhost:8000/docs.
+   - **Web UI** on http://localhost:8000/ — chat + upload + demo button
+   - **OpenAPI docs** on http://localhost:8000/docs
+   - All API routes mounted at `/api/v1/...`
 
 4. **(Optional) Run the test suite**:
    ```bash
    uv run pytest tests/unit -q
-   # 91 passed
+   # 115 passed
    ```
 
-### Sample queries
+### Web UI walkthrough
+
+Open **http://localhost:8000/** for the built-in chat interface (no npm, no build step — Jinja2 + HTMX + Tailwind CDN inside the same FastAPI process).
+
+Two ways to load documents:
+
+**Option A — Quick demo (one click).** The amber **▶ Run full demo** button generates a complex sample PDF (3 tables: SLA metrics, cost breakdown, incidents — see `app/utils/sample_pdf.py`), uploads it, runs ingestion, and shows it as `READY` in the documents panel. Takes ~35 s. Try asking:
+
+- "What was the p95 latency in Q1 2026 and what is the SLA target?"
+- "List the four production incidents with severity and root cause."
+- "How much did OpenAI chat cost in Q1 2026 and what was the percentage change vs Q4 2025?"
+
+**Option B — Manual.** Use the **Upload your own** form to upload any PDF/TXT/MD. The document list polls in real time; you can ask the moment status flips to `READY`.
+
+The chat bubbles show:
+- The grounded answer in English (regardless of source language)
+- One citation pill per `[Sn]` — hovering reveals the source snippet
+- Token count, cost, and a `req: ...` request-id for log correlation
+- A `⚠ Not grounded` badge when the LLM refuses, and a `✓ cache hit` badge when the response cache served the answer
+
+### Sample queries via curl
 
 The samples below assume you've uploaded `data/corpus/sample.txt` (shipped with the repo) and a PDF of your own. Substitute the document ID after upload.
 
@@ -313,13 +450,29 @@ curl -X POST http://localhost:8000/api/v1/ask \
 ```
 Expected: `cache_hit: true`, latency ~150 ms, `estimated_cost_usd: $0` from OpenAI's perspective.
 
-**5. Ask an out-of-corpus question — refusal path**
+**5. Ask an out-of-corpus question — soft refusal**
 ```bash
 curl -X POST http://localhost:8000/api/v1/ask \
   -H "Content-Type: application/json" \
   -d '{"question": "What is the capital of Argentina?"}'
 ```
-Expected: HTTP 404 `NoRelevantContext` — the LLM is never called.
+Expected: HTTP 200, `is_grounded: false`, `refusal_reason: "off_topic"` (or `no_relevant_context_in_corpus` if retrieval found marginal chunks but the LLM refused), `model: "static"` or `gpt-5.4-...`.
+
+**5a. Greeting — static response, no LLM call**
+```bash
+curl -X POST http://localhost:8000/api/v1/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "halo"}'
+```
+Expected: HTTP 200, `model: "static"`, `estimated_cost_usd: "0"`, friendly greeting body.
+
+**5b. Farewell — static response, multilingual**
+```bash
+curl -X POST http://localhost:8000/api/v1/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "grazie ciao"}'
+```
+Expected: HTTP 200, `model: "static"`, `cost: 0`, farewell body — works across English, Italian, Spanish, French, Hindi, Japanese, German.
 
 **6. Empty query — validation rejects**
 ```bash
@@ -429,8 +582,10 @@ Each item below addresses a known limitation. The list is grouped by theme and o
 app/
 ├── api/
 │   ├── application/        # Health endpoints
-│   ├── v1/routes/          # Versioned HTTP routes
+│   ├── v1/routes/          # Versioned HTTP routes (ask, documents, demo)
+│   ├── web/                # Jinja2 + HTMX server-rendered FE views
 │   └── exception_handlers.py
+├── templates/              # Jinja2 HTML (base, index, chat exchange, doc list)
 ├── core/                   # config, exceptions, logging, metrics
 ├── enums/
 ├── models/
@@ -458,7 +613,7 @@ app/
 └── main.py                 # FastAPI app factory + lifespan
 
 migrations/versions/        # Alembic (autogenerated, reviewed)
-tests/unit/                 # 91 unit tests for deterministic layers
+tests/unit/                 # 115 unit tests for deterministic layers
 data/
 ├── corpus/                 # Source documents (gitignored)
 └── index/                  # FAISS index file + metadata
@@ -482,7 +637,7 @@ make format      # ruff format + ruff check --fix
 uv run pytest tests/unit -v
 ```
 
-91 unit tests cover: chunker, token counting, cost estimation, hashing / cache keys, validators, prompt builder + CoT parser, mappers, FAISS store, async read-write lock, BM25 retrieval, RRF fusion, LLM-reranker parsing, text/PDF loaders, and PDF table renderer.
+115 unit tests cover: chunker, token counting, cost estimation, hashing / cache keys, validators, prompt builder (simple + CoT variants + parser), mappers (including stage-timings round-trip), FAISS store, async read-write lock, BM25 retrieval, RRF fusion, LLM-reranker parsing, text/PDF loaders, PDF table renderer, intent classifier (embedding anchors + fast-path with run-collapse normalization).
 
 ### Adding a migration
 
