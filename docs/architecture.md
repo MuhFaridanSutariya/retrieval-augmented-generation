@@ -381,7 +381,69 @@ For `GREETING`/`FAREWELL` from any layer, the response has `model="static"`, `co
 
 Single-word common phrases hit Layer 1 and bypass OpenAI entirely. Multi-word variants fall through to Layer 2 — slower (one OpenAI embed call) but still semantically correct and still `cost=$0` because the LLM is never invoked. Real RAG queries flow through unchanged.
 
-### 15. Dependency wiring — one composition root
+### 15. Tool calling — MCP-shaped registry + tool-aware completion loop
+
+The bonus assignment listed "Allow LLM to call a simple tool (e.g., calculator or search)" with the optional ask to use MCP-like concepts. We implemented:
+
+- A typed **`Tool` dataclass** (name, description, Pydantic args model, async handler) plus a **`ToolRegistry`** that validates schemas at registration and produces the OpenAI `tools=[...]` payload.
+- A **safe arithmetic calculator** (no `eval()` — `_evaluate()` walks an `ast.parse(expression, mode="eval")` tree, allowing only `Constant`/`BinOp`/`UnaryOp` nodes with a small whitelist of operators).
+- A **`list_documents`** tool the LLM can call for meta-questions about the indexed corpus.
+- A **tool-aware completion loop** in `OpenAIChatClient.complete_with_tools()` that handles the OpenAI `tool_calls` round-trip and stops at `MAX_TOOL_ITERATIONS=4`.
+- A new **`enable_tools` flag** plumbed through `AskRequest` → `AskService` → `QueryPipeline`, with the rerank-toggle pattern repeated (cache-key column, FE checkbox, footer pill).
+
+#### Why MCP-shaped, not actual MCP
+
+Implementing the wire MCP protocol (JSON-RPC over stdio) is a separate project. What "MCP-shaped" means here:
+
+- **Schema-first.** Every tool declares a Pydantic model for its arguments; we hand `model.model_json_schema()` to OpenAI. Same shape MCP uses.
+- **Loose coupling between handler and transport.** `Tool.handler` is a plain async callable. Replacing it with an MCP-server RPC is one method change in `ToolRegistry.invoke()`.
+- **Typed result envelope.** `ToolCallResult(name, ok, output, error)` mirrors MCP's `success`/`error` pattern.
+
+#### The completion loop
+
+```
+complete_with_tools(messages, registry, max_iterations=4)
+  └─ for iteration in 1..max_iterations:
+       ├─ openai.chat.completions.create(messages, tools=registry.payload)
+       ├─ response.choices[0].message.tool_calls?
+       │     ├─ no  → return ChatCompletionWithTools(content, tokens, invocations)
+       │     └─ yes → for each tool_call:
+       │              registry.invoke(name, json.loads(arguments))
+       │              messages.append(role="tool", tool_call_id, content=result)
+       │            (continue outer loop)
+       └─ raise ToolLoopExceeded after max_iterations
+```
+
+Token counts and invocation timings are accumulated across iterations and surfaced via `Answer.timings.tool_ms` and `Answer.tool_invocations`.
+
+#### Failure mapping (CLAUDE.md rule 10)
+
+| Failure | Where caught | What the LLM sees | What the user sees |
+|---|---|---|---|
+| Tool name unknown | `ToolRegistry.invoke()` | `ToolCallResult(ok=False, error="ToolNotFound")` returned as the tool message | LLM works around it; bubble shows the failed invocation |
+| Args fail Pydantic validation | `ToolRegistry.invoke()` | `error="ValidationError"`; structured errors in `output` | Same |
+| Handler raises | `ToolRegistry.invoke()` | `error="<ExceptionName>"`; exception message in `output` | Same |
+| Loop runs too many iterations | `complete_with_tools()` | n/a — loop aborts | `ToolLoopExceeded` → HTTP 502 |
+| Calculator gets unsafe expression | `_evaluate()` raises `ValueError` | Caught by registry as a handler exception | Same |
+
+#### Verified live (same numeric question, tools off vs on)
+
+```
+Question: "By exactly what percent did total cost rise from Q4 2025 to Q1 2026?"
+
+tools=OFF
+  total 6675ms  cost=$0.005848  tokens=1864  tool_invocations=0
+  answer: "...((17,940 - 13,335) / 13,335) × 100 ≈ 34.5%."
+
+tools=ON
+  total 5140ms  cost=$0.012390  tokens=4366  tool_invocations=1
+  🛠️ calculate({"expression": "(17940-13335)/13335*100"}) → 34.5332  (0.2ms, ok=True)
+  answer: "...((17,940 - 13,335) / 13,335) × 100 = 34.5332%."
+```
+
+Calculator execution is sub-millisecond — the cost is the extra LLM round, not the math. Trade-off: ~2× per-query cost in exchange for **provably exact** arithmetic on numeric questions.
+
+### 16. Dependency wiring — one composition root
 
 `app/dependencies.py` is the only place that instantiates clients. Everything else receives dependencies via constructor (services, pipelines, retrievers). `Container` is built once during FastAPI `lifespan`, attached to `app.state`, and resolved per-request via `get_*` functions.
 

@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     rerank_top_k: int = 4
     rerank_enabled: bool = True
     rerank_max_output_tokens: int = 100
+    max_tool_iterations: int = 4
+    max_tool_output_chars: int = 4000
     hybrid_candidate_multiplier: int = 3
     rrf_k: int = 60
     min_relevance_score: float = 0.1
@@ -65,6 +67,7 @@ class Settings(BaseSettings):
 
     upload_max_bytes: int = 26_214_400
     upload_allowed_extensions: str = "pdf,txt,md"
+    upload_storage_path: str = "data/uploads"
 
     @property
     def allowed_extensions(self) -> set[str]:

@@ -16,7 +16,9 @@ from app.services.ask_service import AskService
 from app.services.document_service import DocumentService
 from app.storages.database import Database
 from app.storages.faiss_store import FaissStore
+from app.storages.file_storage import FileStorage
 from app.storages.redis_store import RedisStore
+from app.tools import build_default_registry
 from app.validators.intent_classifier import IntentClassifier
 
 
@@ -26,6 +28,7 @@ class Container:
         self.database = Database(settings)
         self.redis_store = RedisStore(settings)
         self.faiss_store = FaissStore(settings)
+        self.file_storage = FileStorage(settings)
 
         self.embedding_cache = EmbeddingCache(self.redis_store, settings)
         self.response_cache = ResponseCache(self.redis_store, settings)
@@ -63,19 +66,28 @@ class Container:
             vector_store=self.faiss_store,
             settings=settings,
         )
-        self.query_pipeline = QueryPipeline(
-            hybrid_retriever=self.hybrid_retriever,
-            reranker=self.reranker,
-            chat_client=self.chat_client,
-            settings=settings,
-        )
 
+        # DocumentService is built before QueryPipeline because the tool
+        # registry needs it for the list_documents tool.
         self.document_service = DocumentService(
             database=self.database,
             vector_store=self.faiss_store,
             ingest_pipeline=self.ingest_pipeline,
+            file_storage=self.file_storage,
             settings=settings,
         )
+        self.tool_registry = build_default_registry(
+            settings=settings,
+            document_service=self.document_service,
+        )
+        self.query_pipeline = QueryPipeline(
+            hybrid_retriever=self.hybrid_retriever,
+            reranker=self.reranker,
+            chat_client=self.chat_client,
+            tool_registry=self.tool_registry,
+            settings=settings,
+        )
+
         self.ask_service = AskService(
             database=self.database,
             query_pipeline=self.query_pipeline,

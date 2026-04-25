@@ -20,8 +20,37 @@
             </div>
 
             <div id="chat-history" class="flex-1 overflow-y-auto px-5 py-4 space-y-4">
-                <div class="text-sm text-slate-400 text-center py-12">
-                    <p>Upload a document or click <span class="font-semibold text-slate-600">Run full demo</span> to get started.</p>
+                <div id="chat-empty-state" class="px-2 py-8 text-center space-y-4">
+                    <p class="text-sm text-slate-500">
+                        Upload a document or click <span class="font-semibold text-slate-700">▶ Run full demo</span> to get started — then try one of these:
+                    </p>
+                    <div class="flex flex-wrap gap-2 justify-center max-w-xl mx-auto">
+                        <button type="button" class="js-suggestion text-left text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg px-3 py-2 border border-slate-200 transition-colors"
+                                data-question="What was the p95 latency in Q1 2026 and the SLA target?">
+                            📊 p95 latency in Q1 2026?
+                        </button>
+                        <button type="button" class="js-suggestion text-left text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg px-3 py-2 border border-slate-200 transition-colors"
+                                data-question="List the four production incidents with severity and root cause.">
+                            🛠️ List the four incidents
+                        </button>
+                        <button type="button" class="js-suggestion text-left text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg px-3 py-2 border border-slate-200 transition-colors"
+                                data-question="How much did OpenAI chat cost in Q1 2026 and what was the percentage change vs Q4 2025?">
+                            💰 OpenAI cost change Q4→Q1?
+                        </button>
+                        <button type="button" class="js-suggestion text-left text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg px-3 py-2 border border-slate-200 transition-colors"
+                                data-question="What is on the Q3 2026 roadmap?">
+                            🗺️ Q3 2026 roadmap?
+                        </button>
+                        <button type="button" class="js-suggestion text-left text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg px-3 py-2 border border-slate-200 transition-colors"
+                                data-question="Compare the Q4 2025 and Q1 2026 service-level metrics. Which improved most and by how much?">
+                            🤔 Compare Q4 vs Q1 metrics
+                        </button>
+                        <button type="button" class="js-suggestion text-left text-xs bg-amber-50 hover:bg-amber-100 text-amber-900 rounded-lg px-3 py-2 border border-amber-200 transition-colors"
+                                data-question="Why did the Q1 2026 cost rise compared to Q4 2025, and which line items drove most of the increase?"
+                                title="Multi-step reasoning — try with Chain-of-Thought mode toggled on">
+                            🧠 Why did costs rise? <span class="text-amber-600">(try with CoT)</span>
+                        </button>
+                    </div>
                 </div>
             </div>
 
@@ -30,7 +59,7 @@
                 hx-post="/web/ask"
                 hx-target="#chat-history"
                 hx-swap="beforeend"
-                hx-on::after-request="this.reset(); document.getElementById('chat-history').scrollTop = document.getElementById('chat-history').scrollHeight;"
+                hx-on::after-request="this.reset(); document.getElementById('chat-empty-state')?.remove(); document.getElementById('chat-history').scrollTop = document.getElementById('chat-history').scrollHeight;"
                 class="border-t border-slate-100 px-5 py-4 space-y-2"
             >
                 <div class="flex gap-2 items-end">
@@ -82,6 +111,19 @@
                         <span>
                             🧠 <span class="font-medium">Chain-of-Thought mode</span>
                             <span class="text-slate-400">— slower &amp; pricier, better for multi-step questions. Off by default.</span>
+                        </span>
+                    </label>
+
+                    <label class="flex items-center gap-2 text-xs text-slate-600 select-none" title="Lets the LLM call registered tools (calculator, list_documents) when it judges them helpful. Adds ~1 extra LLM call per tool round; eliminates math errors on numeric questions.">
+                        <input
+                            type="checkbox"
+                            name="enable_tools"
+                            value="on"
+                            class="h-3.5 w-3.5 rounded border-slate-300 text-slate-900 focus:ring-slate-400"
+                        />
+                        <span>
+                            🛠️ <span class="font-medium">Use tools</span>
+                            <span class="text-slate-400">— calculator + document list. Best for numeric questions. Off by default.</span>
                         </span>
                     </label>
                 </div>

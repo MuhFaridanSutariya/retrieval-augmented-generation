@@ -10,7 +10,18 @@ class StageTimings:
     retrieve_ms: float = 0.0
     rerank_ms: float = 0.0
     complete_ms: float = 0.0
+    tool_ms: float = 0.0
     total_ms: float = 0.0
+
+
+@dataclass(slots=True)
+class ToolInvocationRecord:
+    name: str
+    arguments: dict
+    output: str
+    ok: bool
+    error: str | None = None
+    elapsed_ms: float = 0.0
 
 
 @dataclass(slots=True)
@@ -27,3 +38,4 @@ class Answer:
     prompt_version: str = ""
     cache_hit: bool = False
     timings: StageTimings = field(default_factory=StageTimings)
+    tool_invocations: list[ToolInvocationRecord] = field(default_factory=list)

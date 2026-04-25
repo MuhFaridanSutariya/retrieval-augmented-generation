@@ -9,6 +9,7 @@ from app.models.schema.ask_schema import (
     AskResponse,
     CitationResponse,
     StageTimingsResponse,
+    ToolInvocationResponse,
     UsageResponse,
 )
 from app.models.schema.document_schema import DocumentResponse
@@ -85,8 +86,20 @@ def answer_to_response(answer: Answer, request_id: str) -> AskResponse:
                 retrieve_ms=round(answer.timings.retrieve_ms, 1),
                 rerank_ms=round(answer.timings.rerank_ms, 1),
                 complete_ms=round(answer.timings.complete_ms, 1),
+                tool_ms=round(answer.timings.tool_ms, 1),
                 total_ms=round(answer.timings.total_ms, 1),
             ),
         ),
+        tool_invocations=[
+            ToolInvocationResponse(
+                name=inv.name,
+                arguments=inv.arguments,
+                output=inv.output,
+                ok=inv.ok,
+                error=inv.error,
+                elapsed_ms=round(inv.elapsed_ms, 1),
+            )
+            for inv in answer.tool_invocations
+        ],
         request_id=request_id,
     )

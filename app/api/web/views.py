@@ -81,6 +81,7 @@ async def ask(
     document_id: str = Form(""),
     enable_cot: str = Form(""),
     enable_rerank: str = Form(""),
+    enable_tools: str = Form(""),
     ask_service: AskService = Depends(get_ask_service),
 ) -> HTMLResponse:
     document_ids: list[UUID] | None = None
@@ -94,6 +95,7 @@ async def ask(
     truthy = {"on", "true", "1", "yes"}
     use_cot = enable_cot.strip().lower() in truthy
     use_rerank = enable_rerank.strip().lower() in truthy
+    use_tools = enable_tools.strip().lower() in truthy
 
     try:
         result = await ask_service.ask(
@@ -101,6 +103,7 @@ async def ask(
             document_ids=document_ids,
             use_cot=use_cot,
             use_rerank=use_rerank,
+            use_tools=use_tools,
         )
         return templates.TemplateResponse(
             request,

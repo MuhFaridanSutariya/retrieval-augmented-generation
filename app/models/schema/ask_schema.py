@@ -20,6 +20,12 @@ class AskRequest(BaseModel):
         "(more accurate, slower). When false, skips it (faster, slightly less "
         "accurate). When null, uses the configured server default.",
     )
+    enable_tools: bool = Field(
+        default=False,
+        description="Allow the LLM to call registered tools (e.g. calculator, "
+        "list_documents). Adds 1+ extra LLM call per tool round; better for "
+        "numeric / multi-step questions. Default off.",
+    )
 
 
 class CitationResponse(BaseModel):
@@ -36,6 +42,7 @@ class StageTimingsResponse(BaseModel):
     retrieve_ms: float = 0.0
     rerank_ms: float = 0.0
     complete_ms: float = 0.0
+    tool_ms: float = 0.0
     total_ms: float = 0.0
 
 
@@ -49,10 +56,20 @@ class UsageResponse(BaseModel):
     timings: StageTimingsResponse = Field(default_factory=StageTimingsResponse)
 
 
+class ToolInvocationResponse(BaseModel):
+    name: str
+    arguments: dict
+    output: str
+    ok: bool
+    error: str | None = None
+    elapsed_ms: float = 0.0
+
+
 class AskResponse(BaseModel):
     answer: str
     is_grounded: bool
     refusal_reason: str | None = None
     citations: list[CitationResponse] = Field(default_factory=list)
     usage: UsageResponse
+    tool_invocations: list[ToolInvocationResponse] = Field(default_factory=list)
     request_id: str

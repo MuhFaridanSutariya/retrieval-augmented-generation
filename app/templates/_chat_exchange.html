@@ -18,13 +18,17 @@
                 {% if answer.citations %}
                 <div class="pt-2 mt-2 border-t border-slate-200 flex flex-wrap gap-1.5">
                     {% for citation in answer.citations %}
-                    <span
-                        class="citation-pill inline-flex items-center gap-1 bg-slate-200 hover:bg-amber-200 text-slate-800 text-[11px] font-medium px-2 py-0.5 rounded cursor-help"
-                        title="{{ citation.snippet }}"
+                    <a
+                        href="/api/v1/documents/{{ citation.document_id }}/raw"
+                        target="_blank"
+                        rel="noopener"
+                        class="citation-pill inline-flex items-center gap-1 bg-slate-200 hover:bg-amber-200 text-slate-800 text-[11px] font-medium px-2 py-0.5 rounded no-underline"
+                        title="{{ citation.snippet }}&#10;&#10;Click to open {{ citation.filename }} in a new tab"
                     >
                         [S{{ loop.index }}] {{ citation.filename }}
                         <span class="text-slate-500">· chunk {{ citation.chunk_index }}</span>
-                    </span>
+                        <span class="text-slate-500">↗</span>
+                    </a>
                     {% endfor %}
                 </div>
                 {% endif %}
@@ -42,6 +46,9 @@
                     {% if "rerank:1" in (answer.prompt_version or "") %}
                     <span class="text-purple-700 font-semibold" title="Smart context selection: an extra LLM call re-ranked the retrieved snippets">🎯 reranked</span>
                     {% endif %}
+                    {% if answer.tool_invocations %}
+                    <span class="text-rose-700 font-semibold" title="The LLM called {{ answer.tool_invocations|length }} tool(s) to compute parts of this answer">🛠️ {{ answer.tool_invocations|length }} tool call{% if answer.tool_invocations|length != 1 %}s{% endif %}</span>
+                    {% endif %}
                     <span>{{ answer.prompt_tokens + answer.completion_tokens }} tokens</span>
                     <span>${{ "%.6f"|format(answer.estimated_cost_usd) }}</span>
                     {% if request_id %}
@@ -57,7 +64,26 @@
                     {% if timings.embed_ms %}<span>embed {{ "%.0f"|format(timings.embed_ms) }}</span>{% endif %}
                     {% if timings.retrieve_ms %}<span>retrieve {{ "%.0f"|format(timings.retrieve_ms) }}</span>{% endif %}
                     {% if timings.rerank_ms %}<span>rerank {{ "%.0f"|format(timings.rerank_ms) }}</span>{% endif %}
+                    {% if timings.tool_ms %}<span>tools {{ "%.0f"|format(timings.tool_ms) }}</span>{% endif %}
                     {% if timings.complete_ms %}<span>complete {{ "%.0f"|format(timings.complete_ms) }}</span>{% endif %}
+                </div>
+                {% endif %}
+
+                {% if answer.tool_invocations %}
+                <div class="text-[10px] text-rose-700/70 bg-rose-50 rounded px-2 py-1 space-y-0.5"
+                     title="Tool calls made by the LLM during this turn">
+                    {% for inv in answer.tool_invocations %}
+                    <div class="font-mono">
+                        🛠️ <span class="font-semibold">{{ inv.name }}</span>(<span class="text-rose-900">{{ inv.arguments|tojson }}</span>)
+                        →
+                        {% if inv.ok %}
+                        <span class="text-emerald-800">{{ inv.output[:80] }}{% if inv.output|length > 80 %}…{% endif %}</span>
+                        {% else %}
+                        <span class="text-rose-800">[{{ inv.error }}] {{ inv.output[:60] }}</span>
+                        {% endif %}
+                        <span class="text-rose-400">· {{ "%.0f"|format(inv.elapsed_ms) }}ms</span>
+                    </div>
+                    {% endfor %}
                 </div>
                 {% endif %}
             {% endif %}

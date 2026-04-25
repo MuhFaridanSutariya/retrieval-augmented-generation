@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import Response
 
 from app.dependencies import get_document_service
+from app.enums.file_type import FileType
 from app.models.mappers import document_domain_to_response
 from app.models.schema.document_schema import (
     DocumentListResponse,
@@ -13,6 +14,12 @@ from app.models.schema.document_schema import (
 from app.services.document_service import DocumentService
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+
+_MEDIA_TYPES: dict[FileType, str] = {
+    FileType.PDF: "application/pdf",
+    FileType.TEXT: "text/plain; charset=utf-8",
+    FileType.MARKDOWN: "text/markdown; charset=utf-8",
+}
 
 
 @router.post(
@@ -52,6 +59,20 @@ async def get_document(
 ) -> DocumentResponse:
     document = await document_service.get(document_id)
     return document_domain_to_response(document)
+
+
+@router.get("/{document_id}/raw")
+async def get_document_raw(
+    document_id: UUID,
+    document_service: DocumentService = Depends(get_document_service),
+) -> Response:
+    content, file_type, filename = await document_service.read_raw(document_id)
+    safe_filename = filename.replace('"', "").replace("\n", " ")
+    return Response(
+        content=content,
+        media_type=_MEDIA_TYPES.get(file_type, "application/octet-stream"),
+        headers={"Content-Disposition": f'inline; filename="{safe_filename}"'},
+    )
 
 
 @router.patch("/{document_id}", response_model=DocumentResponse)

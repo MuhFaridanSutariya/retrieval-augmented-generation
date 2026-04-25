@@ -5,7 +5,7 @@ from uuid import UUID
 from app.core.config import Settings
 from app.core.exceptions import CacheError
 from app.core.logging import get_logger
-from app.models.domain.answer import Answer
+from app.models.domain.answer import Answer, ToolInvocationRecord
 from app.models.domain.citation import Citation
 from app.storages.redis_store import RedisStore
 from app.utils.hashing import build_response_cache_key
@@ -87,6 +87,17 @@ def _serialize_answer(answer: Answer) -> str:
             }
             for c in answer.citations
         ],
+        "tool_invocations": [
+            {
+                "name": inv.name,
+                "arguments": inv.arguments,
+                "output": inv.output,
+                "ok": inv.ok,
+                "error": inv.error,
+                "elapsed_ms": inv.elapsed_ms,
+            }
+            for inv in answer.tool_invocations
+        ],
     }
     return json.dumps(payload)
 
@@ -104,6 +115,17 @@ def _deserialize_answer(raw: str) -> Answer:
         )
         for c in payload.get("citations", [])
     ]
+    tool_invocations = [
+        ToolInvocationRecord(
+            name=inv["name"],
+            arguments=inv.get("arguments", {}),
+            output=inv.get("output", ""),
+            ok=inv.get("ok", True),
+            error=inv.get("error"),
+            elapsed_ms=inv.get("elapsed_ms", 0.0),
+        )
+        for inv in payload.get("tool_invocations", [])
+    ]
     return Answer(
         text=payload["text"],
         citations=citations,
@@ -116,4 +138,5 @@ def _deserialize_answer(raw: str) -> Answer:
         model=payload["model"],
         prompt_version=payload["prompt_version"],
         cache_hit=True,
+        tool_invocations=tool_invocations,
     )

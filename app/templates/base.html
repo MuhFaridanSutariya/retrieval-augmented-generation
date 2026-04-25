@@ -17,5 +17,16 @@
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen">
     {% block content %}{% endblock %}
+    <script>
+        // Suggestion chip -> fill the chat textarea so the user can review/edit before sending.
+        document.addEventListener("click", (event) => {
+            const chip = event.target.closest(".js-suggestion");
+            if (!chip) return;
+            const textarea = document.querySelector('textarea[name="question"]');
+            if (!textarea) return;
+            textarea.value = chip.dataset.question || chip.textContent.trim();
+            textarea.focus();
+        });
+    </script>
 </body>
 </html>

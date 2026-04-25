@@ -7,7 +7,7 @@ from app.core.config import Settings
 from app.core.exceptions import NoRelevantContext
 from app.core.logging import get_logger
 from app.llm_clients.openai_chat_client import ChatMessage, OpenAIChatClient
-from app.models.domain.answer import Answer, StageTimings
+from app.models.domain.answer import Answer, StageTimings, ToolInvocationRecord
 from app.models.domain.chunk import RetrievedChunk
 from app.models.mappers import retrieved_chunk_to_citation
 from app.prompts.answer_with_context import (
@@ -19,6 +19,7 @@ from app.prompts.answer_with_context import (
 from app.prompts.system_prompt import select_system_prompt
 from app.retrievers.hybrid_retriever import HybridRetriever
 from app.retrievers.reranker import LLMReranker
+from app.tools.base import ToolRegistry
 from app.utils.token_counting import count_text_tokens, estimate_chat_cost_usd
 
 logger = get_logger(__name__)
@@ -31,11 +32,13 @@ class QueryPipeline:
         hybrid_retriever: HybridRetriever,
         reranker: LLMReranker,
         chat_client: OpenAIChatClient,
+        tool_registry: ToolRegistry,
         settings: Settings,
     ) -> None:
         self._retriever = hybrid_retriever
         self._reranker = reranker
         self._chat_client = chat_client
+        self._tool_registry = tool_registry
         self._settings = settings
 
     async def run(
@@ -47,6 +50,7 @@ class QueryPipeline:
         top_k: int | None = None,
         use_cot: bool = False,
         use_rerank: bool | None = None,
+        use_tools: bool = False,
     ) -> Answer:
         effective_rerank = (
             self._settings.rerank_enabled if use_rerank is None else use_rerank
@@ -97,11 +101,40 @@ class QueryPipeline:
             ),
         ]
 
-        complete_started = time.perf_counter()
-        completion = await self._chat_client.complete(messages)
-        timings.complete_ms = (time.perf_counter() - complete_started) * 1000
+        tool_invocation_records: list[ToolInvocationRecord] = []
 
-        parsed = parse_response(completion.content)
+        complete_started = time.perf_counter()
+        if use_tools:
+            tool_completion = await self._chat_client.complete_with_tools(
+                messages,
+                registry=self._tool_registry,
+            )
+            timings.complete_ms = (time.perf_counter() - complete_started) * 1000
+            timings.tool_ms = sum(inv.elapsed_ms for inv in tool_completion.tool_invocations)
+            content = tool_completion.content
+            prompt_tokens = tool_completion.prompt_tokens
+            completion_tokens = tool_completion.completion_tokens
+            model = tool_completion.model
+            tool_invocation_records = [
+                ToolInvocationRecord(
+                    name=inv.name,
+                    arguments=inv.arguments,
+                    output=inv.output,
+                    ok=inv.ok,
+                    error=inv.error,
+                    elapsed_ms=round(inv.elapsed_ms, 1),
+                )
+                for inv in tool_completion.tool_invocations
+            ]
+        else:
+            completion = await self._chat_client.complete(messages)
+            timings.complete_ms = (time.perf_counter() - complete_started) * 1000
+            content = completion.content
+            prompt_tokens = completion.prompt_tokens
+            completion_tokens = completion.completion_tokens
+            model = completion.model
+
+        parsed = parse_response(content)
         refused = is_refusal(parsed.answer)
         citations = (
             []
@@ -118,20 +151,21 @@ class QueryPipeline:
             is_grounded=not refused,
             refusal_reason="no_relevant_context_in_corpus" if refused else None,
             reasoning=parsed.reasoning,
-            prompt_tokens=completion.prompt_tokens,
-            completion_tokens=completion.completion_tokens,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
             estimated_cost_usd=estimate_chat_cost_usd(
-                completion.prompt_tokens,
-                completion.completion_tokens,
+                prompt_tokens,
+                completion_tokens,
                 self._settings,
             ),
-            model=completion.model,
+            model=model,
             prompt_version=(
                 f"system:{system_version}/user:{user_version}"
-                f"/rerank:{int(effective_rerank)}"
+                f"/rerank:{int(effective_rerank)}/tools:{int(use_tools)}"
             ),
             cache_hit=False,
             timings=timings,
+            tool_invocations=tool_invocation_records,
         )
 
     def _trim_to_budget(

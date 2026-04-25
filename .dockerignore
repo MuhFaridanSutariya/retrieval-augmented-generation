@@ -24,18 +24,17 @@ uv.lock
 *.swp
 .DS_Store
 
-data/corpus/*
-!data/corpus/.gitkeep
+.git/
+.gitignore
+.dockerignore
+
+data/
 
 logs/
 *.log
 
 CLAUDE.md
 ASSIGNMENT.md
-docs/AI Engineer Assignment.pdf
+docs/
 
-data/index/*
-!data/index/.gitkeep
-
-data/uploads/*
-!data/uploads/.gitkeep
+tests/

@@ -12,59 +12,78 @@ A production-like RAG-based AI assistant that answers questions grounded **only*
 - **API:** FastAPI
 - **Web UI:** Server-rendered Jinja2 + HTMX + Tailwind (CDN). No npm, no separate dev server, no build step — the FE lives in the same FastAPI process at `http://localhost:8000/`
 
+## Screenshots
+
+**Standard chat — citations, toggles, and the document panel.**
+
+![Standard chat UI showing question, grounded answer with citation pills, three feature toggles, and the documents sidebar](assets/demo_1.png)
+
+The bubble footer shows live token count, cost (USD, 6 d.p.), request id, and a per-stage latency breakdown. Citation pills hover to reveal the snippet and click to open the source PDF in a new tab.
+
+**Tool calling — same question with 🛠️ Use tools enabled.**
+
+![Chat with the Use tools toggle on; the answer includes a precise percentage and a footer block showing the calculator invocation calculate({"expression":"(17940-13335)/13335*100"}) returning 34.5332](assets/demo_2.png)
+
+The LLM decides to call the calculator (`calculate({"expression": "(17940-13335)/13335*100"}) → 34.5332`) and uses the precise result in its answer. The invocation is visible in the bubble footer with timing and ok/error status.
+
 ## Prerequisites
 
-- Python 3.11+
-- Docker Desktop (for Postgres + Redis)
-- An OpenAI API key
+- **Docker Desktop** (the only requirement for the recommended path)
+- An **OpenAI API key**
 
-## Install `uv`
+That's it. Python, `uv`, and Postgres are all containerized — you don't install them on the host.
+
+## Quick start — one command (recommended)
+
+```bash
+# 1. Drop your OpenAI key into the env file
+cp .env.example .env
+#    then edit .env and replace OPENAI_API_KEY=sk-replace-me with your key
+
+# 2. Build & start everything (Postgres + Redis + API)
+docker compose up
+```
+
+That's it. **Open http://localhost:8000/** and you'll see the chat UI. OpenAPI docs live at **http://localhost:8000/docs**.
+
+What `docker compose up` does on first run:
+- Pulls Postgres 16 + Redis 7
+- Builds the API image (~3-4 min on first build, cached afterwards)
+- Waits for Postgres + Redis healthchecks
+- Runs `alembic upgrade head` automatically
+- Starts uvicorn on port 8000
+
+Subsequent runs just start the existing containers in seconds. Add `-d` to run in the background. To stop: `docker compose down`. To wipe state and start over: `docker compose down -v` (removes the Postgres + Redis volumes; `data/` on the host is preserved).
+
+> **Tip:** the app eagerly embeds the intent-classifier anchors on startup. The first boot makes one OpenAI request (~1 s). The result is cached in Redis so subsequent boots are instant.
+
+## Quick start — local development (with `uv`)
+
+If you want hot-reload while editing Python code, run the API on the host with `uv` and only Postgres + Redis in Docker:
+
+### Install `uv`
 
 [`uv`](https://github.com/astral-sh/uv) is the Python package manager used by this project. It manages the virtualenv and dependencies — no `pip install` needed.
 
-### Windows (PowerShell)
-
-```powershell
+```bash
+# Windows (PowerShell)
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
 
-### macOS / Linux
-
-```bash
+# macOS / Linux
 curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# verify
+uv --version    # 0.10.x or newer
 ```
 
-### Verify
+### Run
 
 ```bash
-uv --version
-# uv 0.10.x  (or newer)
-```
-
-If you already have Python installed, you can also install via `pip`:
-
-```bash
-pip install uv
-```
-
-## Quick start
-
-```bash
-# 1. Install project dependencies into a managed virtualenv (.venv)
-uv sync
-
-# 2. Configure environment
-cp .env.example .env
-#   then set OPENAI_API_KEY in .env
-
-# 3. Start Postgres + Redis
-docker compose up -d
-
-# 4. Apply database migrations
-uv run alembic upgrade head
-
-# 5. Run the API
-uv run uvicorn app.main:app --reload
+uv sync                                       # install deps into .venv
+cp .env.example .env                          # set OPENAI_API_KEY
+docker compose up -d postgres redis           # only the data services
+uv run alembic upgrade head                   # apply migrations
+uv run uvicorn app.main:app --reload          # run with hot-reload
 ```
 
 API is live at http://localhost:8000. OpenAPI docs at http://localhost:8000/docs.
@@ -188,27 +207,61 @@ We picked this two-layer setup over a small LLM router for four reasons:
 
 See [docs/architecture.md §14](docs/architecture.md) for the full design rationale and verified-live results.
 
-## Two UI toggles for accuracy / cost / latency
+## Three UI toggles for accuracy / cost / latency
 
-Both toggles live under the chat input. Each maps to a request flag (and a column in the cache key, so toggling never returns a stale answer from another mode):
+All three toggles live under the chat input. Each maps to a request flag and a column in the cache key, so toggling never returns a stale answer from another mode:
 
 | Toggle | Request field | Default | What it does | Cost / latency hit |
 |---|---|---|---|---|
-| **🎯 Smart context selection** | `enable_rerank` | **on** | Runs an extra LLM call to re-rank retrieved snippets and pick the most relevant ones | +1 LLM call (~1–10 s on slow networks); ~$0.002–0.005/query |
-| **🧠 Chain-of-Thought mode** | `enable_cot` | off | Asks the model to reason step by step inside `<thinking>` tags; FE strips reasoning before render | ~5× output tokens (~$0.003 extra/query); +1–3 s of generation |
+| **🎯 Smart context selection** | `enable_rerank` | **on** | Runs an extra LLM call to re-rank retrieved snippets and pick the most relevant ones | +1 LLM call; ~$0.002–0.005/query |
+| **🧠 Chain-of-Thought mode** | `enable_cot` | off | Reasons step-by-step inside `<thinking>` tags; FE strips reasoning before render | ~5× output tokens (~$0.003 extra/query); +1–3 s of generation |
+| **🛠️ Use tools** | `enable_tools` | off | Lets the LLM call tools (calculator, list_documents) when it judges them helpful. MCP-shaped registry; one file per tool | +1 LLM call per tool round (~$0.005 extra); precise math, no LLM arithmetic errors |
 
 API control:
 ```bash
 curl -X POST http://localhost:8000/api/v1/ask \
   -H "Content-Type: application/json" \
   -d '{
-    "question": "Why did Q1 cost rise vs Q4, and which line items drove it?",
-    "enable_cot": true,
-    "enable_rerank": true
+    "question": "By exactly what percent did total cost rise from Q4 2025 to Q1 2026?",
+    "enable_rerank": true,
+    "enable_cot": false,
+    "enable_tools": true
   }'
 ```
 
-Server defaults come from `RERANK_ENABLED` in `.env`. Per-request `enable_rerank: null` (the default for API consumers who don't send the field) falls back to the server setting.
+Server defaults come from `.env`. Per-request `enable_rerank: null` falls back to the server setting; `enable_cot` and `enable_tools` default to `false`.
+
+The cache key is `system:{simple|cot}/user:{simple|cot}/rerank:{0|1}/tools:{0|1}` — eight mutually-isolated cache buckets, each invalidated independently when its prompt version is bumped.
+
+### Tool calling — the 🛠️ toggle in detail
+
+When **🛠️ Use tools** is on, the LLM receives the registered tools and may emit `tool_calls` instead of (or before) the final answer. The pipeline executes each call, returns the result as a `role="tool"` message, and re-invokes the LLM. The loop terminates when the LLM returns a normal answer or hits `MAX_TOOL_ITERATIONS=4`.
+
+Two tools ship out of the box:
+
+| Tool | Purpose | Args (Pydantic-validated) |
+|---|---|---|
+| `calculate` | Evaluate arithmetic safely (AST-walked, rejects function calls, attribute access, names — no `eval()`). Use for percentages, totals, ratios. | `expression: str` |
+| `list_documents` | Return the indexed corpus (filename, type, size, chunk count, status). For meta-questions like "what docs do I have?" | `limit: int` |
+
+**Adding a new tool** is a single file in `app/tools/`: define a Pydantic args model, write an `async def handler(...) -> str`, and register a `Tool` in `tools/__init__.py:build_default_registry()`. Schema is validated at registration; bad schemas fail fast at app startup.
+
+**Live-measured** on "By exactly what percent did total cost rise from Q4 2025 to Q1 2026?":
+
+| | tools=OFF | tools=ON |
+|---|---|---|
+| Answer precision | "≈ 34.5%" (LLM mental math) | "exactly **34.5332%**" (from calculator) |
+| Tool calls | 0 | 1 — `calculate("(17940-13335)/13335*100") → 34.5332` in 0.2 ms |
+| Cost / query | $0.0058 | $0.0124 |
+
+The bubble footer shows a 🛠️ pill when tools were used, plus a small monospace block listing each invocation: name, arguments, output (truncated to `MAX_TOOL_OUTPUT_CHARS`), success/error flag, and elapsed time.
+
+**Failure handling** (CLAUDE.md rule 10):
+
+- Unknown tool name → `ToolCallResult(ok=False, error="ToolNotFound")` — the LLM sees the error string and can self-correct or refuse.
+- Tool args fail Pydantic validation → `ok=False, error="ValidationError"`.
+- Tool handler raises → `ok=False, error="<ExceptionName>"`. Never breaks the request.
+- Loop exceeds `MAX_TOOL_ITERATIONS` → `ToolLoopExceeded` → HTTP 502.
 
 ### Per-stage timing in every response
 
@@ -383,7 +436,7 @@ No bare `except:` anywhere. Infra errors never leak vendor tracebacks to clients
 4. **(Optional) Run the test suite**:
    ```bash
    uv run pytest tests/unit -q
-   # 115 passed
+   # 138 passed
    ```
 
 ### Web UI walkthrough
@@ -613,7 +666,7 @@ app/
 └── main.py                 # FastAPI app factory + lifespan
 
 migrations/versions/        # Alembic (autogenerated, reviewed)
-tests/unit/                 # 115 unit tests for deterministic layers
+tests/unit/                 # 138 unit tests for deterministic layers
 data/
 ├── corpus/                 # Source documents (gitignored)
 └── index/                  # FAISS index file + metadata
@@ -637,7 +690,7 @@ make format      # ruff format + ruff check --fix
 uv run pytest tests/unit -v
 ```
 
-115 unit tests cover: chunker, token counting, cost estimation, hashing / cache keys, validators, prompt builder (simple + CoT variants + parser), mappers (including stage-timings round-trip), FAISS store, async read-write lock, BM25 retrieval, RRF fusion, LLM-reranker parsing, text/PDF loaders, PDF table renderer, intent classifier (embedding anchors + fast-path with run-collapse normalization).
+138 unit tests cover: chunker, token counting, cost estimation, hashing / cache keys, validators, prompt builder (simple + CoT variants + parser), mappers (including stage-timings round-trip), FAISS store, async read-write lock, BM25 retrieval, RRF fusion, LLM-reranker parsing, text/PDF loaders, PDF table renderer, intent classifier (embedding anchors + fast-path with run-collapse normalization), tool registry (registration, validation, invocation, error capture), and the calculator AST evaluator (safety against function calls, attribute access, names, lambdas, strings).
 
 ### Adding a migration
 

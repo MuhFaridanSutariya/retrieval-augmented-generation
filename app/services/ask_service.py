@@ -61,17 +61,19 @@ class AskService:
         top_k: int | None = None,
         use_cot: bool = False,
         use_rerank: bool | None = None,
+        use_tools: bool = False,
     ) -> AskResult:
         effective_rerank = (
             self._settings.rerank_enabled if use_rerank is None else use_rerank
         )
-        # Cache key includes the prompt-variant + rerank flag so the four
-        # combinations of (CoT, rerank) on/off don't collide and toggling
-        # any of them invalidates the cache as expected.
+        # Cache key includes the prompt-variant, rerank flag, and tools flag so all
+        # eight combinations of (CoT, rerank, tools) on/off don't collide and
+        # toggling any one of them invalidates the cache as expected.
         _, system_version = select_system_prompt(use_cot=use_cot)
         user_version = select_user_prompt_version(use_cot=use_cot)
         prompt_version = (
-            f"system:{system_version}/user:{user_version}/rerank:{int(effective_rerank)}"
+            f"system:{system_version}/user:{user_version}"
+            f"/rerank:{int(effective_rerank)}/tools:{int(use_tools)}"
         )
         validated_question = validate_question(question)
         request_id = uuid4().hex
@@ -140,6 +142,7 @@ class AskService:
                     top_k=top_k,
                     use_cot=use_cot,
                     use_rerank=use_rerank,
+                    use_tools=use_tools,
                 )
         except NoRelevantContext:
             answer = self._off_topic_answer()

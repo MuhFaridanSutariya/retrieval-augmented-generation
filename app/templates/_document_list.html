@@ -12,7 +12,17 @@
         <li class="border border-slate-100 rounded-lg p-3 {% if latest_id and doc.id|string == latest_id %}ring-2 ring-amber-300 bg-amber-50{% endif %}">
             <div class="flex items-start justify-between gap-2">
                 <div class="min-w-0 flex-1">
-                    <p class="text-sm font-medium truncate" title="{{ doc.filename }}">{{ doc.filename }}</p>
+                    {% if doc.status.value == "READY" %}
+                    <a
+                        href="/api/v1/documents/{{ doc.id }}/raw"
+                        target="_blank"
+                        rel="noopener"
+                        class="text-sm font-medium truncate text-slate-900 hover:text-blue-700 hover:underline block"
+                        title="Open {{ doc.filename }} in a new tab"
+                    >{{ doc.filename }} ↗</a>
+                    {% else %}
+                    <p class="text-sm font-medium truncate text-slate-700" title="{{ doc.filename }}">{{ doc.filename }}</p>
+                    {% endif %}
                     <div class="text-xs text-slate-500 mt-0.5 flex items-center gap-2 flex-wrap">
                         <span class="uppercase tracking-wide">{{ doc.file_type.value }}</span>
                         <span>·</span>

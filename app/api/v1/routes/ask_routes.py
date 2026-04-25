@@ -19,5 +19,6 @@ async def ask(
         top_k=payload.top_k,
         use_cot=payload.enable_cot,
         use_rerank=payload.enable_rerank,
+        use_tools=payload.enable_tools,
     )
     return answer_to_response(result.answer, result.request_id)

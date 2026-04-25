@@ -9,6 +9,10 @@ class DocumentNotFound(AppError):
     pass
 
 
+class DocumentFileMissing(AppError):
+    pass
+
+
 class DocumentAlreadyExists(AppError):
     pass
 
@@ -74,4 +78,20 @@ class MalformedLLMResponse(LLMError):
 
 
 class TokenBudgetExceeded(AppError):
+    pass
+
+
+class ToolError(AppError):
+    pass
+
+
+class ToolNotFound(ToolError):
+    pass
+
+
+class ToolValidationError(ToolError):
+    pass
+
+
+class ToolLoopExceeded(ToolError):
     pass
