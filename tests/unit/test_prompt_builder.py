@@ -98,6 +98,23 @@ def test_parse_response_empty_string() -> None:
     assert parsed.reasoning is None
 
 
+def test_parse_response_strips_nested_answer_tags() -> None:
+    raw = (
+        "<thinking>reasoning</thinking>\n"
+        "<answer>\n<answer>The real answer [S1].</answer>\n</answer>"
+    )
+    parsed = parse_response(raw)
+    assert "<answer>" not in parsed.answer
+    assert "</answer>" not in parsed.answer
+    assert "The real answer [S1]." in parsed.answer
+
+
+def test_parse_response_strips_residue_when_only_one_set_of_tags() -> None:
+    raw = "<answer>Final [S1].</answer>"
+    parsed = parse_response(raw)
+    assert parsed.answer == "Final [S1]."
+
+
 def test_is_refusal_detects_refusal_sentence() -> None:
     assert is_refusal("I do not have enough information in the provided documents to answer that.")
     assert is_refusal(

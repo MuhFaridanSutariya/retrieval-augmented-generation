@@ -11,6 +11,10 @@ REFUSAL_SENTENCE = (
 
 _THINKING_PATTERN = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL | re.IGNORECASE)
 _ANSWER_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+# Defensive cleanup: occasionally the model nests its own tags or includes a
+# stray opening tag inside the captured block. Strip any residue so we never
+# return literal "<answer>" text to the client.
+_TAG_RESIDUE_PATTERN = re.compile(r"</?(?:answer|thinking)>", re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -62,6 +66,10 @@ def parse_response(raw: str) -> ParsedResponse:
     else:
         # No tags at all — treat the whole response as the answer (safety fallback).
         answer = raw.strip()
+
+    answer = _TAG_RESIDUE_PATTERN.sub("", answer).strip()
+    if reasoning is not None:
+        reasoning = _TAG_RESIDUE_PATTERN.sub("", reasoning).strip() or None
 
     return ParsedResponse(answer=answer, reasoning=reasoning)
 

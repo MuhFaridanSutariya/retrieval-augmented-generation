@@ -1,14 +1,16 @@
-from app.core.exceptions import AppError
+from ftfy import fix_text
 
-
-class TextDecodeError(AppError):
-    pass
+_UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
 
 
 def load_text(content: bytes) -> str:
-    for encoding in ("utf-8", "utf-16", "latin-1"):
+    try:
+        return fix_text(content.decode("utf-8"))
+    except UnicodeDecodeError:
+        pass
+    if content.startswith(_UTF16_BOMS):
         try:
-            return content.decode(encoding)
+            return fix_text(content.decode("utf-16"))
         except UnicodeDecodeError:
-            continue
-    raise TextDecodeError("Could not decode text file with utf-8, utf-16, or latin-1.")
+            pass
+    return fix_text(content.decode("latin-1"))

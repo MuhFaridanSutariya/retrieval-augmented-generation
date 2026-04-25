@@ -239,7 +239,37 @@ Applied to `FaissStore`:
 - Multiple uvicorn workers. FAISS state is in-process, so N workers = N copies of the index. When the corpus outgrows one process, the right move is swapping FAISS for Qdrant/Pinecone, not stapling workers around an in-memory store.
 - `FastAPI.BackgroundTasks` for ingestion. Our test corpora ingest in a few seconds and the contract `POST /documents → status=READY` is simpler than polling. Easy to add when documents grow.
 
-### 13. Dependency wiring — one composition root
+### 13. Complex PDF handling — hybrid pypdf + pdfplumber
+
+Real-world PDFs mix prose, tables, multi-column layout, and occasionally images. `loaders/pdf_loader.py` runs **two passes** per file and merges the results:
+
+1. **Prose pass — `pypdf.extract_text()`** for each page. Fast, well-tested for born-digital PDFs, fixed against mojibake by `ftfy` after extraction.
+2. **Table pass — `pdfplumber.extract_tables()`** on the same pages. Each detected table becomes a Markdown table via `_table_to_markdown()`:
+
+   ```
+   | Quarter | Revenue |
+   | --- | --- |
+   | Q1 | 100 |
+   | Q2 | 200 |
+   ```
+
+   Cells with newlines are flattened with spaces; cells containing pipes are escaped (`a|b` → `a\|b`); short rows are padded to the widest row.
+
+The two outputs are concatenated per page (`prose + "\n\n" + table_md_1 + "\n\n" + table_md_2 ...`) so chunking sees them together. Markdown tables embed and retrieve as well as prose, and gpt-5.4 reads them natively.
+
+**Verified live** on a generated 5 KB PDF with three real tables (SLA metrics, cost breakdown, incidents):
+
+| Question | Answer |
+|---|---|
+| "What was the p95 latency in Q1 2026 and the SLA target?" | "**3100 ms**, SLA target **≤ 5000 ms**" — exact cell match |
+| "How much did OpenAI chat cost in Q1 2026 and the % change?" | "**$16,820**, **+35.6%** vs Q4 2025" |
+| "List the four production incidents with severity and root cause." | All four returned with date / severity / cause from the table |
+
+**Failure isolation:** if pdfplumber fails to open the PDF or chokes on a page, we log a warning and continue with pypdf-only output. Tables are an enhancement, never a load-bearing dependency.
+
+**Acknowledged limitations** (see "What was intentionally not built" below): we don't OCR scanned/image-only PDFs, don't extract chart data from images, and pypdf can interleave columns in heavy multi-column layouts. The upgrade path is documented (Tesseract OCR fallback + vision-LLM for charts).
+
+### 14. Dependency wiring — one composition root
 
 `app/dependencies.py` is the only place that instantiates clients. Everything else receives dependencies via constructor (services, pipelines, retrievers). `Container` is built once during FastAPI `lifespan`, attached to `app.state`, and resolved per-request via `get_*` functions.
 
@@ -270,10 +300,53 @@ Client-side `tiktoken` counts drift 1–5 tokens from the API's `usage.prompt_to
 
 Kept out of scope to stay within the 8–12h budget while hitting all core requirements:
 
-- **Hybrid search / BM25 reranking** — bonus. Vector retrieval + relevance-score floor hits an acceptable quality bar for the corpus sizes the assignment expects.
 - **Chat UI** — bonus. OpenAPI Swagger at `/docs` is already interactive.
 - **Tool calling / MCP** — bonus. Not required for grounded Q&A.
-- **Integration tests** against live OpenAI / Postgres / Redis — covered by 46 unit tests on deterministic layers plus end-to-end manual verification.
+- **Integration tests** against live OpenAI / Postgres / Redis — covered by 91 unit tests on deterministic layers plus the live smoke tests documented in this file.
 - **Streaming responses** — `gpt-5.4-2026-03-05` supports SSE but the API contract asks for a single response; streaming would require client changes.
 
 All of these can be added within the existing architecture without refactoring.
+
+## Future improvements
+
+The README has the full table; this section calls out the highest-leverage items along with the **specific files** an engineer would touch. Wrappers in `loaders/`, `storages/`, `llm_clients/`, and `retrievers/` were chosen so each upgrade is local — no business-logic refactor required.
+
+### PDF & ingestion
+
+| Upgrade | Touches | What changes |
+|---|---|---|
+| **OCR fallback for scanned PDFs** | `loaders/pdf_loader.py`, `core/config.py` | If pypdf returns < N chars, route the page bytes to `pytesseract` (free, system Tesseract install) or AWS Textract / Azure Document Intelligence (paid, better on tables-in-scans). Add `UPLOAD_ENABLE_OCR` flag. |
+| **Vision-LLM enrichment for charts/diagrams** | `loaders/pdf_loader.py`, new `loaders/page_image_loader.py` | Render each PDF page to PNG via `pypdfium2`, send to gpt-5.4 (vision) with a "transcribe this page including any charts" prompt, append result to text. Per-page cost ~$0.005-$0.02. |
+| **Multi-column layout** | swap `pypdf` → `PyMuPDF (fitz)` in `pdf_loader.py` | Fitz has layout-aware reading order out of the box. License is AGPL — fine internally, blocker for proprietary product packaging. |
+| **Header/footer stripping** | `loaders/pdf_loader.py` | Heuristic: detect repeated short lines across pages and drop them before chunking. Or pull in `unstructured.io`'s element classifier (heavier but more reliable). |
+
+### Retrieval & accuracy
+
+| Upgrade | Touches | What changes |
+|---|---|---|
+| **Cross-encoder reranker** | new `retrievers/cross_encoder_reranker.py`, `dependencies.py` | `bge-reranker-v2-m3` (~600 MB) runs locally in 30 ms vs the current 1-2 s LLM rerank. Quality comparable; ongoing cost is electricity. Wire as a drop-in replacement for `LLMReranker` (same `rerank()` signature). |
+| **Query rewriting** | new `retrievers/query_rewriter.py`, `pipelines/query_pipeline.py` | One cheap LLM call rewrites the question into 2-3 search queries; run hybrid retrieval per rewrite; fuse via RRF. Big lift on conversational queries; +200 ms latency. |
+| **HyDE** | `retrievers/vector_retriever.py` | LLM drafts a hypothetical answer first, embed THAT, retrieve. Often beats raw query embedding for short queries. |
+| **Language-aware BM25 tokenization** | `retrievers/bm25_retriever.py` | Replace regex `_tokenize` with `Snowball` (stemming), `Jieba` (Chinese), or `Sudachi` (Japanese). Detect per chunk with `langdetect`. Multilingual corpora gain noticeable recall. |
+
+### Scale, ops, safety
+
+| Upgrade | Touches | What changes |
+|---|---|---|
+| **Qdrant or Pinecone for multi-worker** | `storages/qdrant_store.py` (new) replacing `faiss_store.py` | Same wrapper interface — only `dependencies.py` changes. Required once corpus crosses a single process. |
+| **HNSW for >500K chunks** | `storages/faiss_store.py` | Swap `IndexFlatIP` for `IndexHNSWFlat`; expose `efSearch` in config. Sub-linear scan, ~99% recall@10. |
+| **Background ingestion** | `services/document_service.py`, `api/v1/routes/document_routes.py` | `BackgroundTasks` (small) or `ARQ`/`Celery` (long jobs). Status surfaced via `GET /documents/{id}`. Changes the API contract — clients must poll. |
+| **OpenTelemetry tracing** | `core/metrics.py`, `main.py` | Replace structlog metrics with OTel; FastAPI auto-instrumentation traces every layer. Adds `/metrics` for Prometheus. |
+| **Rate limiting + auth** | `main.py`, new `dependencies.py` providers | `slowapi` for per-IP/per-tenant limits; FastAPI `Depends` for API-key or JWT auth. |
+| **Streaming responses** | new `api/v1/routes/ask_stream_routes.py` | SSE; buffer the `<thinking>` block server-side, stream only `<answer>` content to the client. |
+| **Prompt-injection / safety classifier** | `validators/query_validator.py` | Cheap regex + classifier guard before the question reaches the LLM. |
+
+### Evaluation & cost
+
+| Upgrade | Touches | What changes |
+|---|---|---|
+| **Golden-set CI eval** | new `tests/eval/`, `Makefile`, GitHub Action | `make eval` runs `golden_set.yaml`; CI surfaces accuracy delta + cost delta vs the baseline branch. |
+| **Embedding Batch API for re-index** | `embedders/openai_embedder.py` | Add a `embed_batch_async()` path using OpenAI's Batch API (50% cheaper, 24-hour SLA). Use for one-time corpus re-embeds, not per-query. |
+| **Prompt A/B framework** | `prompts/__init__.py`, `services/ask_service.py` | Hash request → bucket → choose `SYSTEM_PROMPT_V3` vs `SYSTEM_PROMPT_V4`; log per-bucket metrics. Ship prompt changes safely. |
+
+If I had **one more day**, the order would be: OCR fallback → cross-encoder reranker → background ingestion → tracing → streaming. That's ~80% of the production-readiness gap closed in a single iteration.
